@@ -1,0 +1,33 @@
+{
+  "name": "SoloAgent",
+  "version": "1.0.0",
+  "workspace": "workspace",
+  "data_dir": "data",
+  "log_dir": "logs",
+  "llm": {
+    "api_url": "https://api.siliconflow.cn/v1/chat/completions",
+    "api_key": "在此填入你的API Key",
+    "model": "deepseek-ai/DeepSeek-V3",
+    "temperature": 0.7,
+    "max_tokens": 2048,
+    "timeout": 60
+  },
+  "knowledge": {
+    "db_path": "data/knowledge.db",
+    "auto_save_interval": 30
+  },
+  "scheduler": {
+    "task_queue_size": 100,
+    "max_concurrent_tasks": 3,
+    "task_timeout": 300,
+    "retry_max": 3,
+    "retry_delay": 2.0,
+    "cycle_interval": 1.0,
+    "optimize_interval": 5
+  },
+  "webapi": {
+    "host": "0.0.0.0",
+    "port": 8899,
+    "debug": false
+  }
+}
