@@ -77,8 +77,10 @@ class KnowledgeGraph:
         self._graph = nx.DiGraph()
         self._lock = threading.Lock()  # 线程安全锁
         self._conn = None
+        self._last_sync_version = 0  # 用于多实例同步
         self._init_db()
         self._load_from_db()
+        self._last_sync_version = self._get_db_version()
         logger.info(f"知识图谱初始化完成: {self._graph.number_of_nodes()} 节点, {self._graph.number_of_edges()} 边")
     
     def _get_conn(self) -> sqlite3.Connection:
@@ -86,7 +88,92 @@ class KnowledgeGraph:
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
             self._conn.row_factory = sqlite3.Row
+            # 启用 WAL 模式提高并发性能
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
+    
+    def _get_db_version(self) -> int:
+        """获取数据库版本号（用于多实例同步）"""
+        try:
+            conn = self._get_conn()
+            # 使用 SQLite 的 user_version 或查询最大时间戳
+            cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(updated_at) as max_time FROM nodes")
+            row = cursor.fetchone()
+            count = row['cnt'] if row else 0
+            max_time = row['max_time'] if row and row['max_time'] else ""
+            return count + hash(max_time) % 1000000
+        except:
+            return 0
+    
+    def _sync_from_db(self):
+        """从数据库同步最新数据到内存图（多实例共享时调用）"""
+        current_version = self._get_db_version()
+        if current_version == self._last_sync_version:
+            return  # 无需同步
+        
+        with self._lock:
+            conn = self._get_conn()
+            
+            # 获取数据库中所有节点ID
+            db_node_ids = set()
+            cursor = conn.execute("SELECT id FROM nodes")
+            for row in cursor:
+                db_node_ids.add(row['id'])
+            
+            # 获取内存图中的节点ID
+            mem_node_ids = set(self._graph.nodes())
+            
+            # 添加新节点
+            new_ids = db_node_ids - mem_node_ids
+            if new_ids:
+                placeholders = ','.join('?' * len(new_ids))
+                cursor = conn.execute(f"SELECT * FROM nodes WHERE id IN ({placeholders})", list(new_ids))
+                for row in cursor:
+                    node = KnowledgeNode(
+                        id=row['id'], title=row['title'], content=row['content'],
+                        category=row['category'], tags=json.loads(row['tags']),
+                        metadata=json.loads(row['metadata']),
+                        created_at=row['created_at'], updated_at=row['updated_at'],
+                        importance=row['importance']
+                    )
+                    self._graph.add_node(node.id, **asdict(node))
+            
+            # 删除已移除的节点
+            removed_ids = mem_node_ids - db_node_ids
+            for node_id in removed_ids:
+                if node_id in self._graph:
+                    self._graph.remove_node(node_id)
+            
+            # 同步边
+            db_edges = set()
+            cursor = conn.execute("SELECT source, target, relation FROM edges")
+            for row in cursor:
+                db_edges.add((row['source'], row['target'], row['relation']))
+            
+            mem_edges = set()
+            for u, v, data in self._graph.edges(data=True):
+                mem_edges.add((u, v, data.get('relation', 'related_to')))
+            
+            # 添加新边
+            for source, target, relation in db_edges - mem_edges:
+                if source in self._graph and target in self._graph:
+                    cursor = conn.execute(
+                        "SELECT * FROM edges WHERE source=? AND target=? AND relation=?",
+                        (source, target, relation)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        self._graph.add_edge(
+                            source, target,
+                            relation=row['relation'], weight=row['weight'],
+                            metadata=json.loads(row['metadata']),
+                            created_at=row['created_at']
+                        )
+            
+            self._last_sync_version = current_version
+            if new_ids or removed_ids or (db_edges != mem_edges):
+                logger.debug(f"知识图谱同步: +{len(new_ids)}节点 -{len(removed_ids)}节点, 边变化{len(db_edges - mem_edges)}")
     
     def _init_db(self):
         """初始化数据库表结构"""
@@ -174,6 +261,7 @@ class KnowledgeGraph:
     
     def get_node(self, node_id: str) -> Optional[Dict]:
         """获取节点"""
+        self._sync_from_db()  # 多实例同步
         if node_id in self._graph:
             return dict(self._graph.nodes[node_id])
         return None
@@ -181,6 +269,7 @@ class KnowledgeGraph:
     def search_nodes(self, query: str, category: Optional[str] = None, 
                      limit: int = 20) -> List[Dict]:
         """搜索节点 - 基于关键词匹配"""
+        self._sync_from_db()  # 多实例同步
         results = []
         query_lower = query.lower()
         
@@ -204,6 +293,7 @@ class KnowledgeGraph:
     
     def get_nodes_by_category(self, category: str) -> List[Dict]:
         """按类别获取节点"""
+        self._sync_from_db()  # 多实例同步
         return [
             dict(data) for _, data in self._graph.nodes(data=True)
             if data.get('category') == category
@@ -253,6 +343,7 @@ class KnowledgeGraph:
     
     def get_neighbors(self, node_id: str, relation: Optional[str] = None) -> List[Dict]:
         """获取邻居节点"""
+        self._sync_from_db()  # 多实例同步
         if node_id not in self._graph:
             return []
         neighbors = []
@@ -270,6 +361,7 @@ class KnowledgeGraph:
     
     def find_path(self, source: str, target: str) -> Optional[List[str]]:
         """查找两个节点之间的最短路径"""
+        self._sync_from_db()  # 多实例同步
         try:
             return nx.shortest_path(self._graph, source, target)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
@@ -277,6 +369,7 @@ class KnowledgeGraph:
     
     def get_related_knowledge(self, node_id: str, max_depth: int = 2) -> Dict:
         """获取与某节点相关的知识子图"""
+        self._sync_from_db()  # 多实例同步
         if node_id not in self._graph:
             return {"nodes": [], "edges": []}
         
@@ -306,6 +399,7 @@ class KnowledgeGraph:
     
     def get_stats(self) -> Dict:
         """获取图谱统计信息"""
+        self._sync_from_db()  # 多实例同步
         categories = {}
         for _, data in self._graph.nodes(data=True):
             cat = data.get('category', 'unknown')
@@ -389,6 +483,7 @@ class KnowledgeGraph:
     
     def get_relevant_context(self, task_description: str) -> str:
         """为任务获取相关上下文 - Agent 执行前的关键步骤"""
+        self._sync_from_db()  # 多实例同步
         # 搜索相关经验
         experiences = self.search_nodes(task_description, limit=5)
         methods = self.search_nodes(task_description, category="method", limit=3)

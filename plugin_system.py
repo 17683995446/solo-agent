@@ -1,0 +1,405 @@
+# -*- coding: utf-8 -*-
+"""
+SoloAgent 插件系统 v2.0
+第一性原理：功能 = 插件的集合，核心 = 插件的容器
+"""
+
+import os
+import sys
+import json
+import logging
+import importlib
+import importlib.util
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+import traceback
+
+logger = logging.getLogger("agent.plugins")
+
+
+@dataclass
+class PluginInfo:
+    """插件元数据"""
+    name: str
+    version: str
+    description: str
+    author: str
+    entry_point: str  # 入口类名
+    dependencies: List[str] = field(default_factory=list)
+    config_schema: Dict = field(default_factory=dict)
+    enabled: bool = True
+
+
+class PluginInterface(ABC):
+    """
+    插件接口 - 所有插件必须实现
+    第一性原理：插件 = 输入处理函数 + 生命周期管理
+    """
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self._initialized = False
+    
+    @abstractmethod
+    def get_info(self) -> PluginInfo:
+        """返回插件元数据"""
+        pass
+    
+    @abstractmethod
+    def execute(self, params: Dict, context: str = "") -> Any:
+        """
+        执行插件功能
+        params: 任务参数
+        context: 知识图谱上下文
+        return: 执行结果
+        """
+        pass
+    
+    def initialize(self) -> bool:
+        """初始化插件 - 子类可覆盖"""
+        self._initialized = True
+        return True
+    
+    def shutdown(self):
+        """关闭插件 - 子类可覆盖"""
+        self._initialized = False
+    
+    def get_config(self, key: str, default=None):
+        """获取配置项"""
+        return self.config.get(key, default)
+    
+    def validate_params(self, params: Dict) -> tuple[bool, str]:
+        """
+        验证参数 - 子类可覆盖
+        return: (是否有效, 错误信息)
+        """
+        return True, ""
+
+
+class PluginManager:
+    """
+    插件管理器
+    职责：发现、加载、管理插件生命周期
+    """
+    
+    def __init__(self, plugin_dirs: List[str] = None):
+        self.plugin_dirs = plugin_dirs or ["plugins", "~/.solo_agent/plugins"]
+        self._plugins: Dict[str, PluginInterface] = {}  # name -> instance
+        self._handlers: Dict[str, Callable] = {}  # task_type -> execute function
+        self._metadata: Dict[str, PluginInfo] = {}  # name -> info
+        
+        # 展开用户目录
+        self.plugin_dirs = [
+            os.path.expanduser(d) for d in self.plugin_dirs
+        ]
+    
+    def discover_plugins(self) -> List[Path]:
+        """发现所有可用插件"""
+        discovered = []
+        for plugin_dir in self.plugin_dirs:
+            if not os.path.exists(plugin_dir):
+                continue
+            for item in Path(plugin_dir).iterdir():
+                if item.is_dir() and (item / "plugin.json").exists():
+                    discovered.append(item)
+                elif item.suffix == ".py" and item.stem != "__init__":
+                    discovered.append(item)
+        return discovered
+    
+    def load_plugin(self, plugin_path) -> Optional[str]:
+        """
+        加载单个插件
+        plugin_path: Path对象或字符串路径
+        return: 插件名称或None
+        """
+        try:
+            # ★ Bug修复：兼容字符串路径
+            plugin_path = Path(plugin_path) if not isinstance(plugin_path, Path) else plugin_path
+            if plugin_path.is_dir():
+                return self._load_package_plugin(plugin_path)
+            else:
+                return self._load_single_file_plugin(plugin_path)
+        except Exception as e:
+            logger.error(f"加载插件失败 {plugin_path}: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def _load_package_plugin(self, plugin_dir: Path) -> Optional[str]:
+        """加载包格式插件（目录 + plugin.json）"""
+        manifest_path = plugin_dir / "plugin.json"
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+        
+        info = PluginInfo(**manifest)
+        
+        if info.name in self._plugins:
+            logger.warning(f"插件 {info.name} 已存在，跳过")
+            return None
+        
+        # 动态导入
+        init_file = plugin_dir / "__init__.py"
+        if not init_file.exists():
+            init_file = plugin_dir / f"{info.entry_point}.py"
+        
+        spec = importlib.util.spec_from_file_location(
+            f"plugin_{info.name}", init_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        
+        # 实例化插件类
+        plugin_class = getattr(module, info.entry_point)
+        instance = plugin_class()
+        
+        if not instance.initialize():
+            logger.error(f"插件 {info.name} 初始化失败")
+            return None
+        
+        self._plugins[info.name] = instance
+        self._metadata[info.name] = info
+        
+        # 注册任务处理器
+        self._register_handlers(instance)
+        
+        logger.info(f"✓ 插件加载成功: {info.name} v{info.version}")
+        return info.name
+    
+    def _load_single_file_plugin(self, plugin_file: Path) -> Optional[str]:
+        """加载单文件插件（简化格式）"""
+        spec = importlib.util.spec_from_file_location(
+            f"plugin_{plugin_file.stem}", plugin_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        
+        # 查找插件类（继承PluginInterface）
+        plugin_class = None
+        for name in dir(module):
+            obj = getattr(module, name)
+            if (isinstance(obj, type) and 
+                issubclass(obj, PluginInterface) and 
+                obj is not PluginInterface):
+                plugin_class = obj
+                break
+        
+        if not plugin_class:
+            logger.warning(f"在 {plugin_file} 中未找到插件类")
+            return None
+        
+        instance = plugin_class()
+        info = instance.get_info()
+        
+        if info.name in self._plugins:
+            logger.warning(f"插件 {info.name} 已存在，跳过")
+            return None
+        
+        if not instance.initialize():
+            logger.error(f"插件 {info.name} 初始化失败")
+            return None
+        
+        self._plugins[info.name] = instance
+        self._metadata[info.name] = info
+        self._register_handlers(instance)
+        
+        logger.info(f"✓ 插件加载成功: {info.name} v{info.version}")
+        return info.name
+    
+    def _register_handlers(self, plugin: PluginInterface):
+        """注册插件的任务处理器"""
+        info = plugin.get_info()
+        # 使用插件名作为任务类型
+        self._handlers[info.name] = plugin.execute
+        
+        # 插件可以注册多个别名
+        aliases = plugin.config.get("aliases", [])
+        for alias in aliases:
+            self._handlers[alias] = plugin.execute
+    
+    def unload_plugin(self, name: str) -> bool:
+        """卸载插件"""
+        if name not in self._plugins:
+            return False
+        
+        plugin = self._plugins[name]
+        info = plugin.get_info()
+        
+        # 注销处理器
+        handlers_to_remove = [info.name] + plugin.config.get("aliases", [])
+        for handler_name in handlers_to_remove:
+            if handler_name in self._handlers:
+                del self._handlers[handler_name]
+        
+        # 关闭插件
+        plugin.shutdown()
+        
+        # 清理
+        del self._plugins[name]
+        del self._metadata[name]
+        
+        logger.info(f"✓ 插件已卸载: {name}")
+        return True
+    
+    def reload_plugin(self, name: str) -> bool:
+        """热重载插件"""
+        if name not in self._plugins:
+            return False
+        
+        # 找到插件路径
+        # 简化实现：先卸载再重新发现加载
+        self.unload_plugin(name)
+        
+        for plugin_path in self.discover_plugins():
+            loaded_name = self.load_plugin(plugin_path)
+            if loaded_name == name:
+                return True
+        
+        return False
+    
+    def get_handler(self, task_type: str) -> Optional[Callable]:
+        """获取任务处理器"""
+        return self._handlers.get(task_type)
+    
+    def list_plugins(self) -> List[Dict]:
+        """列出所有插件"""
+        return [
+            {
+                "name": name,
+                "version": info.version,
+                "description": info.description,
+                "enabled": info.enabled,
+                "handlers": [name] + self._plugins[name].config.get("aliases", [])
+            }
+            for name, info in self._metadata.items()
+        ]
+    
+    def load_all(self):
+        """加载所有发现的插件"""
+        discovered = self.discover_plugins()
+        logger.info(f"发现 {len(discovered)} 个插件")
+        
+        loaded = 0
+        for plugin_path in discovered:
+            if self.load_plugin(plugin_path):
+                loaded += 1
+        
+        logger.info(f"成功加载 {loaded}/{len(discovered)} 个插件")
+        return loaded
+
+
+# ============================================================
+# 示例插件：HTTP请求插件
+# ============================================================
+
+class HttpRequestPlugin(PluginInterface):
+    """HTTP请求插件 - 示例"""
+    
+    def get_info(self) -> PluginInfo:
+        return PluginInfo(
+            name="http_request",
+            version="1.0.0",
+            description="发送HTTP请求并返回响应",
+            author="SoloAgent",
+            entry_point="HttpRequestPlugin",
+            config_schema={
+                "timeout": {"type": "number", "default": 30},
+                "max_retries": {"type": "number", "default": 3}
+            }
+        )
+    
+    def execute(self, params: Dict, context: str = "") -> Any:
+        import requests
+        
+        url = params.get("url")
+        method = params.get("method", "GET").upper()
+        headers = params.get("headers", {})
+        data = params.get("data")
+        timeout = self.get_config("timeout", 30)
+        
+        if not url:
+            return {"error": "缺少URL参数"}
+        
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                data=data,
+                timeout=timeout
+            )
+            return {
+                "status_code": response.status_code,
+                "headers": dict(response.headers),
+                "body": response.text[:5000]  # 限制长度
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def validate_params(self, params: Dict) -> tuple[bool, str]:
+        if "url" not in params:
+            return False, "缺少必需参数: url"
+        return True, ""
+
+
+# ============================================================
+# 示例插件：数据库操作插件
+# ============================================================
+
+class DatabasePlugin(PluginInterface):
+    """数据库操作插件 - 示例"""
+    
+    def __init__(self, config: Dict = None):
+        super().__init__(config)
+        self._connections = {}
+    
+    def get_info(self) -> PluginInfo:
+        return PluginInfo(
+            name="database",
+            version="1.0.0",
+            description="执行SQL查询",
+            author="SoloAgent",
+            entry_point="DatabasePlugin"
+        )
+    
+    def initialize(self) -> bool:
+        """初始化数据库连接池"""
+        # 这里可以建立连接池
+        return True
+    
+    def execute(self, params: Dict, context: str = "") -> Any:
+        import sqlite3
+        
+        db_path = params.get("db_path", "data/default.db")
+        query = params.get("query")
+        
+        if not query:
+            return {"error": "缺少查询语句"}
+        
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(query)
+            
+            if query.strip().upper().startswith("SELECT"):
+                results = [dict(row) for row in cursor.fetchall()]
+                return {"results": results, "count": len(results)}
+            else:
+                conn.commit()
+                return {"affected_rows": cursor.rowcount}
+                
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            conn.close()
+    
+    def shutdown(self):
+        """关闭所有连接"""
+        for conn in self._connections.values():
+            try:
+                conn.close()
+            except:
+                pass
+        self._connections.clear()
