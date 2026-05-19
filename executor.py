@@ -302,7 +302,8 @@ class TaskExecutor:
         计算任务 - 安全执行数学表达式
         修复：正确处理计算错误
         """
-        expr = self._safe_get_param(task, "expression", task.description)
+        # ★ Bug修复：兼容 expr 和 expression 两种参数名
+        expr = task.params.get("expr") or task.params.get("expression") or task.description
         
         # 安全检查：只允许数学字符
         allowed = set("0123456789+-*/.() %^")

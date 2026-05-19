@@ -238,7 +238,7 @@ class EnhancedScheduler:
         self._lock = threading.RLock()
         
         # 定时任务检查间隔
-        self._schedule_check_interval = 1.0
+        self._schedule_check_interval = 0.1  # ★ 性能优化：从 1.0 降低到 0.1
     
     def submit(self, task: Task) -> str:
         """提交任务"""
