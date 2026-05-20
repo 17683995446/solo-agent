@@ -6,6 +6,7 @@ SoloAgent LLM 路由系统 v2.0
 
 import random
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable
@@ -65,6 +66,7 @@ class BaseLLMProvider(ABC):
     
     def __init__(self, config: LLMConfig):
         self.config = config
+        self._stats_lock = threading.Lock()
         self._stats = {
             "total_requests": 0,
             "successful_requests": 0,
@@ -91,7 +93,8 @@ class BaseLLMProvider(ABC):
     
     def get_stats(self) -> Dict:
         """获取统计信息"""
-        stats = dict(self._stats)
+        with self._stats_lock:
+            stats = dict(self._stats)
         if stats["total_requests"] > 0:
             stats["success_rate"] = stats["successful_requests"] / stats["total_requests"]
             stats["avg_latency_ms"] = stats["total_latency_ms"] / stats["total_requests"]
@@ -102,17 +105,18 @@ class BaseLLMProvider(ABC):
     
     def _update_stats(self, success: bool, tokens: int, latency_ms: float, error: str = ""):
         """更新统计"""
-        self._stats["total_requests"] += 1
-        if success:
-            self._stats["successful_requests"] += 1
-            self._stats["total_tokens"] += tokens
-            self._stats["total_latency_ms"] += latency_ms
-        else:
-            self._stats["failed_requests"] += 1
-            if error:
-                self._stats["errors"].append({"time": time.time(), "error": error})
-                # 只保留最近10个错误
-                self._stats["errors"] = self._stats["errors"][-10:]
+        with self._stats_lock:
+            self._stats["total_requests"] += 1
+            if success:
+                self._stats["successful_requests"] += 1
+                self._stats["total_tokens"] += tokens
+                self._stats["total_latency_ms"] += latency_ms
+            else:
+                self._stats["failed_requests"] += 1
+                if error:
+                    self._stats["errors"].append({"time": time.time(), "error": error})
+                    # 只保留最近10个错误
+                    self._stats["errors"] = self._stats["errors"][-10:]
 
 
 class OpenAICompatibleProvider(BaseLLMProvider):
@@ -145,7 +149,11 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 response.raise_for_status()
                 
                 data = response.json()
-                content = data['choices'][0]['message']['content']
+                # Bug修复 #6: 防御性检查 — 确保 choices 非空再访问
+                choices = data.get('choices', [])
+                if not choices or not choices[0].get('message'):
+                    raise ValueError(f"API响应格式异常: choices为空或缺少message字段")
+                content = choices[0]['message']['content']
                 usage = data.get('usage', {})
                 
                 tokens_prompt = usage.get('prompt_tokens', 0)
@@ -172,9 +180,6 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 )
                 
             except requests.exceptions.Timeout:
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(self.config.retry_delay * (attempt + 1))
-                    continue
                 error = f"请求超时 ({self.config.timeout}s)"
                 
             except requests.exceptions.HTTPError as e:
@@ -228,7 +233,11 @@ class OllamaProvider(BaseLLMProvider):
             response.raise_for_status()
             
             data = response.json()
-            content = data['message']['content']
+            # Bug修复 #7: 防御性检查 — 确保 message 字段存在
+            message = data.get('message')
+            if not message or not message.get('content'):
+                raise ValueError(f"Ollama API响应格式异常: 缺少message或content字段")
+            content = message['content']
             
             # Ollama不返回token计数，估算
             tokens_prompt = sum(len(m['content']) // 4 for m in messages)
@@ -279,19 +288,22 @@ class LLMRouter:
         self._fallback_enabled: bool = True
         self._health_check_interval: int = 60
         self._last_health_check: float = 0
+        # Bug修复 #8: 添加锁保护 round_robin_index 的非原子操作
+        self._select_lock = threading.Lock()
     
     def register_provider(self, config: LLMConfig) -> bool:
         """注册LLM提供商"""
-        if config.name in self._providers:
-            logger.warning(f"提供商 {config.name} 已存在，将覆盖")
-        
-        # 根据提供商类型创建对应实例
-        if config.provider == LLMProviderType.OLLAMA:
-            provider = OllamaProvider(config)
-        else:
-            provider = OpenAICompatibleProvider(config)
-        
-        self._providers[config.name] = provider
+        with self._select_lock:
+            if config.name in self._providers:
+                logger.warning(f"提供商 {config.name} 已存在，将覆盖")
+
+            # 根据提供商类型创建对应实例
+            if config.provider == LLMProviderType.OLLAMA:
+                provider = OllamaProvider(config)
+            else:
+                provider = OpenAICompatibleProvider(config)
+
+            self._providers[config.name] = provider
         logger.info(f"✓ 注册LLM提供商: {config.name} ({config.model})")
         return True
 
@@ -300,16 +312,18 @@ class LLMRouter:
         ★ 新增：直接注册 provider 实例（用于测试和自定义 provider）
         """
         name = provider.config.name
-        self._providers[name] = provider
+        with self._select_lock:
+            self._providers[name] = provider
         logger.info(f"✓ 注册LLM提供商实例: {name} ({provider.config.model})")
         return True
 
     def unregister_provider(self, name: str) -> bool:
         """注销LLM提供商"""
-        if name in self._providers:
-            del self._providers[name]
-            logger.info(f"✓ 注销LLM提供商: {name}")
-            return True
+        with self._select_lock:
+            if name in self._providers:
+                del self._providers[name]
+                logger.info(f"✓ 注销LLM提供商: {name}")
+                return True
         return False
     
     def set_strategy(self, strategy: str):
@@ -329,48 +343,50 @@ class LLMRouter:
     
     def _select_provider(self) -> Optional[BaseLLMProvider]:
         """根据策略选择提供商"""
-        enabled_providers = [
-            p for p in self._providers.values()
-            if p.config.enabled
-        ]
-        
-        if not enabled_providers:
-            return None
-        
-        if self._strategy == "priority":
-            # 选择优先级最高的
-            return max(enabled_providers, key=lambda p: p.config.priority)
-        
-        elif self._strategy == "round_robin":
-            # 轮询
-            provider = enabled_providers[self._round_robin_index % len(enabled_providers)]
-            self._round_robin_index += 1
-            return provider
-        
-        elif self._strategy == "weighted":
-            # 按权重随机选择
-            weights = [p.config.weight for p in enabled_providers]
-            total = sum(weights)
-            r = random.uniform(0, total)
-            cumulative = 0
-            for provider in enabled_providers:
-                cumulative += provider.config.weight
-                if r <= cumulative:
-                    return provider
-            return enabled_providers[-1]
-        
-        elif self._strategy == "cost":
-            # 选择成本最低的
-            return min(enabled_providers, key=lambda p: p.config.cost_per_1k_tokens)
-        
-        elif self._strategy == "quality":
-            # 选择成功率最高的
-            def get_success_rate(p):
-                stats = p.get_stats()
-                return stats.get("success_rate", 0)
-            return max(enabled_providers, key=get_success_rate)
-        
-        return enabled_providers[0]
+        # Bug修复 #8: 使用锁保护 round_robin_index 的读取和递增操作
+        with self._select_lock:
+            enabled_providers = [
+                p for p in self._providers.values()
+                if p.config.enabled
+            ]
+            
+            if not enabled_providers:
+                return None
+            
+            if self._strategy == "priority":
+                # 选择优先级最高的
+                return max(enabled_providers, key=lambda p: p.config.priority)
+            
+            elif self._strategy == "round_robin":
+                # 轮询
+                provider = enabled_providers[self._round_robin_index % len(enabled_providers)]
+                self._round_robin_index += 1
+                return provider
+            
+            elif self._strategy == "weighted":
+                # 按权重随机选择
+                weights = [p.config.weight for p in enabled_providers]
+                total = sum(weights)
+                r = random.uniform(0, total)
+                cumulative = 0
+                for provider in enabled_providers:
+                    cumulative += provider.config.weight
+                    if r <= cumulative:
+                        return provider
+                return enabled_providers[-1]
+            
+            elif self._strategy == "cost":
+                # 选择成本最低的
+                return min(enabled_providers, key=lambda p: p.config.cost_per_1k_tokens)
+            
+            elif self._strategy == "quality":
+                # 选择成功率最高的
+                def get_success_rate(p):
+                    stats = p.get_stats()
+                    return stats.get("success_rate", 0)
+                return max(enabled_providers, key=get_success_rate)
+            
+            return enabled_providers[0]
     
     def chat(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
         """
@@ -460,6 +476,7 @@ class LLMRouter:
 # ============================================================
 
 _global_router: Optional[LLMRouter] = None
+_global_router_lock = threading.Lock()
 
 
 def get_llm_router() -> Optional[LLMRouter]:
@@ -470,5 +487,7 @@ def get_llm_router() -> Optional[LLMRouter]:
 def init_llm_router() -> LLMRouter:
     """初始化全局LLM路由器"""
     global _global_router
-    _global_router = LLMRouter()
-    return _global_router
+    with _global_router_lock:
+        if _global_router is None:
+            _global_router = LLMRouter()
+        return _global_router

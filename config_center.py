@@ -6,15 +6,12 @@ SoloAgent 配置中心 v2.0
 
 import os
 import json
-import yaml
 import time
 import logging
 import threading
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 logger = logging.getLogger("agent.config_center")
 
@@ -134,6 +131,7 @@ class ConfigCenter:
             
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
+                    import yaml
                     loaded = yaml.safe_load(f) or {}
                 else:
                     loaded = json.load(f)
@@ -262,32 +260,36 @@ class ConfigCenter:
     
     def register_listener(self, key: str, callback: Callable):
         """注册特定配置项的变更监听器"""
-        if key not in self._listeners:
-            self._listeners[key] = []
-        self._listeners[key].append(callback)
+        with self._lock:
+            if key not in self._listeners:
+                self._listeners[key] = []
+            self._listeners[key].append(callback)
     
     def register_global_listener(self, callback: Callable):
         """注册全局配置变更监听器"""
-        self._global_listeners.append(callback)
+        with self._lock:
+            self._global_listeners.append(callback)
     
     def _notify_change(self, key: str, old_value: Any, new_value: Any, source: str):
         """通知配置变更"""
         event = ConfigChangeEvent(key, old_value, new_value, source)
         
-        # 通知特定监听器
-        if key in self._listeners:
-            for callback in self._listeners[key]:
-                try:
-                    callback(event)
-                except Exception as e:
-                    logger.error(f"配置变更监听器异常: {e}")
+        # 先在锁内收集需要通知的回调
+        with self._lock:
+            callbacks = list(self._listeners.get(key, []))
+            global_callbacks = list(self._global_listeners)
         
-        # 通知全局监听器
-        for callback in self._global_listeners:
+        # 释放锁后再调用回调
+        for callback in callbacks:
             try:
                 callback(event)
             except Exception as e:
-                logger.error(f"全局配置变更监听器异常: {e}")
+                logger.warning(f"配置变更监听器异常: {e}")
+        for callback in global_callbacks:
+            try:
+                callback(event)
+            except Exception as e:
+                logger.warning(f"全局配置监听器异常: {e}")
         
         logger.info(f"配置变更: {key} = {new_value} (来源: {source})")
     
@@ -295,6 +297,9 @@ class ConfigCenter:
         """启动配置文件热更新监听"""
         if self._watching:
             return
+        
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
         
         class ConfigFileHandler(FileSystemEventHandler):
             def __init__(self, config_center):
@@ -333,11 +338,14 @@ class ConfigCenter:
         """保存配置到文件"""
         try:
             with self._lock:
-                with open(self.config_path, 'w', encoding='utf-8') as f:
-                    if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
-                        yaml.dump(self._config, f, allow_unicode=True, default_flow_style=False)
-                    else:
-                        json.dump(self._config, f, ensure_ascii=False, indent=2)
+                config_copy = dict(self._config)
+            
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
+                    import yaml
+                    yaml.dump(config_copy, f, allow_unicode=True, default_flow_style=False)
+                else:
+                    json.dump(config_copy, f, ensure_ascii=False, indent=2)
             
             logger.info(f"配置已保存: {self.config_path}")
             return True
@@ -355,6 +363,12 @@ class ConfigCenter:
         if key:
             return self._schema.get(key)
         return dict(self._schema)
+
+    def register_schema(self, key: str, schema: ConfigSchema):
+        """注册配置 schema"""
+        with self._lock:
+            self._schema[key] = schema
+            logger.info(f"已注册配置 schema: {key}")
 
 
 # ============================================================
@@ -395,6 +409,7 @@ class ConfigurableMixin:
 
 # 全局配置中心实例
 _global_config_center: Optional[ConfigCenter] = None
+_global_cc_lock = threading.Lock()
 
 
 def get_config_center() -> Optional[ConfigCenter]:
@@ -405,6 +420,8 @@ def get_config_center() -> Optional[ConfigCenter]:
 def init_config_center(config_path: str = "config.yaml") -> ConfigCenter:
     """初始化全局配置中心"""
     global _global_config_center
-    _global_config_center = ConfigCenter(config_path)
-    _global_config_center.load()
-    return _global_config_center
+    with _global_cc_lock:
+        if _global_config_center is None:
+            _global_config_center = ConfigCenter(config_path)
+            _global_config_center.load()
+        return _global_config_center

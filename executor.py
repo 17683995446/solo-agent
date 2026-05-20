@@ -11,6 +11,7 @@ import logging
 import traceback
 import os
 import re
+import threading
 from typing import Optional, Callable, Dict, Any, List
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -74,7 +75,8 @@ class Task:
             "error": self.error, "method": self.method,
             "created_at": self.created_at, "started_at": self.started_at,
             "completed_at": self.completed_at, "retry_count": self.retry_count,
-            "priority": self.priority
+            "priority": self.priority,
+            "metadata": self.metadata
         }
 
 
@@ -89,7 +91,6 @@ class TaskExecutor:
     """
     
     # 安全配置
-    ALLOWED_WORKSPACE = os.path.abspath("workspace")
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
     MAX_STRING_LENGTH = 100000  # 最大字符串长度
     
@@ -98,6 +99,9 @@ class TaskExecutor:
         self.llm = llm_client
         self.config = config
         self._handlers = {}
+        # Bug修复: 记录 executor 创建时间，用于 health_check 计算真实运行时间
+        self._start_time = time.time()
+        self._stats_lock = threading.Lock()
         self._stats = {
             "total_executed": 0,
             "total_success": 0,
@@ -105,6 +109,7 @@ class TaskExecutor:
             "total_retries": 0,
             "security_blocked": 0
         }
+        self._workspace = os.path.abspath("workspace")
         self._register_builtin_handlers()
     
     def _register_builtin_handlers(self):
@@ -137,23 +142,19 @@ class TaskExecutor:
         """
         验证文件路径安全性
         修复：防止路径穿越攻击 - 明确拒绝而非静默重定向
+        Bug修复: 使用 os.path.realpath 替代 os.path.abspath，防止符号链接绕过安全检查
         """
         if not filepath:
             raise SecurityError("未指定文件路径")
         
-        # 规范化路径
-        abs_path = os.path.abspath(filepath)
-        
-        # 检查路径穿越模式
-        if '..' in filepath or filepath.startswith('/') or filepath.startswith('~'):
-            raise SecurityError(f"路径穿越被拒绝: {filepath}")
+        # Bug修复: 使用 realpath 解析符号链接，防止通过符号链接绕过工作目录限制
+        abs_path = os.path.realpath(filepath)
         
         # 只允许在工作目录内操作
-        workspace = os.path.abspath("workspace")
-        os.makedirs(workspace, exist_ok=True)
+        os.makedirs(self._workspace, exist_ok=True)
         
         # 检查最终路径是否在工作目录内
-        if not abs_path.startswith(workspace):
+        if not abs_path.startswith(self._workspace):
             raise SecurityError(f"访问被拒绝: 只允许在workspace目录内操作")
         
         return abs_path
@@ -194,7 +195,8 @@ class TaskExecutor:
                 task.result = str(result)[:self.MAX_STRING_LENGTH]  # 限制长度
                 task.status = TaskStatus.SUCCESS.value
                 task.method = f"handler:{task.task_type}"
-                self._stats["total_success"] += 1
+                with self._stats_lock:
+                    self._stats["total_success"] += 1
             else:
                 # 未知任务类型 - 不应重试
                 raise TaskExecutionError(f"未找到任务类型 '{task.task_type}' 的处理器")
@@ -203,26 +205,30 @@ class TaskExecutor:
             # 安全错误 - 记录但不重试
             task.error = f"安全错误: {str(e)}"
             task.status = TaskStatus.FAILED.value
-            self._stats["total_failed"] += 1
-            self._stats["security_blocked"] += 1
+            with self._stats_lock:
+                self._stats["total_failed"] += 1
+                self._stats["security_blocked"] += 1
             logger.warning(f"  ⚠ 安全拦截: {task.error}")
         
         except TaskExecutionError as e:
             # 任务执行错误 - 不应重试的错误
             task.error = str(e)
             task.status = TaskStatus.FAILED.value
-            self._stats["total_failed"] += 1
+            with self._stats_lock:
+                self._stats["total_failed"] += 1
             logger.error(f"  ✗ {task.error}")
         
         except Exception as e:
             task.error = f"{type(e).__name__}: {str(e)}"
             task.status = TaskStatus.FAILED.value
-            self._stats["total_failed"] += 1
+            with self._stats_lock:
+                self._stats["total_failed"] += 1
             logger.error(f"  ✗ 任务执行异常: {task.error}\n{traceback.format_exc()}")
         
         finally:
             task.completed_at = datetime.now().isoformat()
-            self._stats["total_executed"] += 1
+            with self._stats_lock:
+                self._stats["total_executed"] += 1
             
             # 将结果存入知识图谱
             if self.kg:
@@ -257,9 +263,22 @@ class TaskExecutor:
             if attempt > 0:
                 task.retry_count = attempt
                 task.status = TaskStatus.RETRYING.value
-                self._stats["total_retries"] += 1
+                with self._stats_lock:
+                    self._stats["total_retries"] += 1
                 logger.info(f"  ↻ 重试任务 [{task.id}] 第 {attempt} 次 (共 {max_retries} 次)")
-                time.sleep(retry_delay * attempt)
+                # Bug修复: 将 time.sleep 改为分段 sleep，每段检查 should_stop，确保重试等待期间能响应停止信号
+                total_wait = retry_delay * attempt
+                elapsed = 0.0
+                step = 0.5  # 每 0.5 秒检查一次停止信号
+                while elapsed < total_wait:
+                    if should_stop and should_stop():
+                        task.error = "任务被取消（系统停止）"
+                        task.status = TaskStatus.FAILED.value
+                        logger.info(f"  ⊘ 任务 [{task.id}] 在重试等待中被取消")
+                        return task
+                    sleep_time = min(step, total_wait - elapsed)
+                    time.sleep(sleep_time)
+                    elapsed += sleep_time
             
             self.execute(task)
             
@@ -317,6 +336,8 @@ class TaskExecutor:
                 raise SecurityError(f"禁止的表达式模式: {pattern}")
         
         try:
+            # 将 ^ 替换为 ** (幂运算)
+            expr = str(expr).replace('^', '**')
             # 使用受限的eval
             result = eval(expr, {"__builtins__": {}}, {})
             return f"计算结果: {expr} = {result}"
@@ -437,9 +458,12 @@ class TaskExecutor:
     def _handle_health_check(self, task: Task, context: str) -> str:
         """健康检查任务"""
         import sys
-        
+
+        # Bug修复: 使用 time.time() - self._start_time 计算真实运行时间，而非直接使用 time.time()
+        uptime = time.time() - self._start_time
+
         checks = {
-            "系统运行时间": f"{time.time():.0f}s",
+            "系统运行时间": f"{uptime:.0f}s",
             "Python版本": sys.version.split()[0],
             "工作目录": os.getcwd(),
             "知识图谱": f"{'正常' if self.kg else '未配置'}",
@@ -572,7 +596,15 @@ class TaskExecutor:
         return f"Pipeline 完成 ({len(results)}步):\n{summary}"
     
     def get_stats(self) -> Dict:
-        return dict(self._stats)
+        with self._stats_lock:
+            return dict(self._stats)
+    
+    def health_check(self) -> str:
+        """公开的健康检查方法 - 可直接调用无需创建Task"""
+        return self._handle_health_check(
+            Task(name="health_check", description="系统健康检查", task_type="health_check"),
+            ""
+        )
     
     def get_registered_handlers(self) -> List[str]:
         return list(self._handlers.keys())

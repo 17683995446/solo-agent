@@ -321,7 +321,9 @@ class EnhancedScheduler:
             if success:
                 task.state = TaskState.SUCCESS
                 task.status = "success"  # 同步 executor 兼容字段
-                task.result = str(result) if result else ""
+                # [Bug修复] result=0, result=[], result=False 等 falsy 值不应被转为空字符串，
+                # 只有 result=None 才表示无结果
+                task.result = str(result)[:5000] if result is not None else ""
                 self._stats["total_completed"] += 1
                 logger.info(f"✓ 任务 {task.name} 完成")
                 
@@ -394,8 +396,9 @@ class EnhancedScheduler:
         task.status = "running"  # 同步 executor 兼容字段
         task.started_at = datetime.now()
 
-        # 设置超时
-        timeout = task.timeout or self.config.get("task_timeout", 300)
+        # [Bug修复] timeout=0 是合法值（表示立即超时），不能用 `or` 判断，
+        # 因为 0 是 falsy 值会被跳过，导致 timeout=0 被错误当作"无超时"
+        timeout = task.timeout if task.timeout is not None else self.config.get("task_timeout", 300)
 
         # ★ Bug修复：使用Event协调超时，避免阻塞调度循环
         completion_event = threading.Event()
@@ -543,6 +546,14 @@ class EnhancedScheduler:
             task.state = TaskState.CANCELLED
             self._stats["total_cancelled"] += 1
             logger.info(f"⊘ 任务 {task.name} 已取消")
+
+            # [Bug修复] cancel_task 只修改 state 但未从 _ready_queue 移除被取消的任务，
+            # 导致队列积累无效条目。重建就绪队列，过滤掉已取消/非就绪状态的任务。
+            self._ready_queue = [
+                entry for entry in self._ready_queue
+                if entry[2] != task_id  # entry = (-priority, created_at, task_id)
+            ]
+
             return True
     
     def get_task(self, task_id: str) -> Optional[Task]:

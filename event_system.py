@@ -6,13 +6,13 @@ SoloAgent 事件系统 v2.0
 
 import asyncio
 import logging
+import os
 import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Callable, Any, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-import weakref
 
 logger = logging.getLogger("agent.events")
 
@@ -61,9 +61,11 @@ class Event:
     priority: int = 0  # 越高越优先处理
     
     def __post_init__(self):
+        # Bug修复 #4: 在覆盖 self.type 之前先保存原始自定义类型字符串
         if isinstance(self.type, str):
+            custom_type_str = self.type
             self.type = EventType.CUSTOM
-            self.data["custom_type"] = self.type
+            self.data["custom_type"] = custom_type_str
 
 
 class EventHandler(ABC):
@@ -94,7 +96,8 @@ class EventBus:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._processor_task: Optional[asyncio.Task] = None
         self._lock = threading.RLock()
-        
+        self._stats_lock = threading.Lock()
+
         # 事件统计
         self._stats = {
             "published": 0,
@@ -150,7 +153,8 @@ class EventBus:
                 break
             except Exception as e:
                 logger.error(f"事件处理异常: {e}")
-                self._stats["errors"] += 1
+                with self._stats_lock:
+                    self._stats["errors"] += 1
     
     async def _dispatch(self, event: Event):
         """分发事件到处理器"""
@@ -165,10 +169,12 @@ class EventBus:
         for handler in handlers:
             try:
                 handler(event)
-                self._stats["handled"] += 1
+                with self._stats_lock:
+                    self._stats["handled"] += 1
             except Exception as e:
                 logger.error(f"同步处理器异常: {e}")
-                self._stats["errors"] += 1
+                with self._stats_lock:
+                    self._stats["errors"] += 1
         
         # 异步处理
         if async_handlers:
@@ -183,10 +189,12 @@ class EventBus:
         """运行异步处理器"""
         try:
             await handler(event)
-            self._stats["handled"] += 1
+            with self._stats_lock:
+                self._stats["handled"] += 1
         except Exception as e:
             logger.error(f"异步处理器异常: {e}")
-            self._stats["errors"] += 1
+            with self._stats_lock:
+                self._stats["errors"] += 1
     
     def subscribe(self, event_type: EventType, handler: Callable, async_mode: bool = False):
         """
@@ -195,14 +203,11 @@ class EventBus:
         async_mode: 是否异步处理
         """
         with self._lock:
-            if async_mode:
-                if event_type not in self._async_handlers:
-                    self._async_handlers[event_type] = []
-                self._async_handlers[event_type].append(handler)
-            else:
-                if event_type not in self._handlers:
-                    self._handlers[event_type] = []
-                self._handlers[event_type].append(handler)
+            target_list = self._async_handlers if async_mode else self._handlers
+            if event_type not in target_list:
+                target_list[event_type] = []
+            if handler not in target_list[event_type]:  # 防止重复订阅
+                target_list[event_type].append(handler)
         
         handler_name = getattr(handler, '__name__', handler.__class__.__name__)
         logger.debug(f"订阅 {event_type.name}: {handler_name}")
@@ -221,7 +226,8 @@ class EventBus:
         同步接口，内部异步处理
         """
         if not self._running:
-            self._stats["dropped"] += 1
+            with self._stats_lock:
+                self._stats["dropped"] += 1
             return False
         
         try:
@@ -234,11 +240,13 @@ class EventBus:
             else:
                 self._event_queue.put_nowait(event)
             
-            self._stats["published"] += 1
+            with self._stats_lock:
+                self._stats["published"] += 1
             return True
         except Exception as e:
             logger.error(f"发布事件失败: {e}")
-            self._stats["dropped"] += 1
+            with self._stats_lock:
+                self._stats["dropped"] += 1
             return False
     
     def publish_sync(self, event: Event):
@@ -249,14 +257,17 @@ class EventBus:
         for handler in handlers:
             try:
                 handler(event)
-                self._stats["handled"] += 1
+                with self._stats_lock:
+                    self._stats["handled"] += 1
             except Exception as e:
                 logger.error(f"同步处理器异常: {e}")
-                self._stats["errors"] += 1
+                with self._stats_lock:
+                    self._stats["errors"] += 1
     
     def get_stats(self) -> Dict:
         """获取事件统计"""
-        return dict(self._stats)
+        with self._stats_lock:
+            return dict(self._stats)
 
 
 # ============================================================
@@ -283,11 +294,14 @@ class MetricsEventHandler:
         event_name = event.type.name
         if event_name not in self.metrics:
             self.metrics[event_name] = []
-        
+
         self.metrics[event_name].append({
             "timestamp": event.timestamp,
             "data": event.data
         })
+
+        if len(self.metrics[event_name]) > 1000:
+            self.metrics[event_name] = self.metrics[event_name][-500:]
     
     def get_metrics(self, event_type: EventType = None) -> Dict:
         if event_type:
@@ -301,6 +315,11 @@ class AuditEventHandler:
     def __init__(self, log_file: str = "logs/audit.log"):
         self.log_file = log_file
         self._audit_logger = logging.getLogger("agent.audit")
+        
+        # Bug修复 #5: 在创建 FileHandler 前确保 logs/ 目录存在
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         
         # 配置审计日志处理器
         handler = logging.FileHandler(log_file, encoding='utf-8')

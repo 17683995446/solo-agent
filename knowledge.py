@@ -75,7 +75,7 @@ class KnowledgeGraph:
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
         self._graph = nx.DiGraph()
-        self._lock = threading.Lock()  # 线程安全锁
+        self._lock = threading.RLock()  # 线程安全锁（可重入，支持同一线程嵌套获取）
         self._conn = None
         self._last_sync_version = 0  # 用于多实例同步
         self._init_db()
@@ -85,50 +85,75 @@ class KnowledgeGraph:
     
     def _get_conn(self) -> sqlite3.Connection:
         """获取数据库连接（线程安全）"""
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
-            self._conn.row_factory = sqlite3.Row
-            # 启用 WAL 模式提高并发性能
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-        return self._conn
+        # [修复5] 在 _get_conn() 中添加 self._lock 保护，防止多线程同时创建连接导致竞态条件
+        with self._lock:
+            if self._conn is None:
+                self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+                self._conn.row_factory = sqlite3.Row
+                # 启用 WAL 模式提高并发性能
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+            return self._conn
     
     def _get_db_version(self) -> int:
-        """获取数据库版本号（用于多实例同步）"""
+        """获取数据库版本号（用于多实例同步），包含节点和边的变更"""
         try:
             conn = self._get_conn()
-            # 使用 SQLite 的 user_version 或查询最大时间戳
-            cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(updated_at) as max_time FROM nodes")
+            cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(id) as max_id FROM nodes")
             row = cursor.fetchone()
-            count = row['cnt'] if row else 0
-            max_time = row['max_time'] if row and row['max_time'] else ""
-            return count + hash(max_time) % 1000000
-        except:
+            node_count = row['cnt'] if row else 0
+            max_node_id = row['max_id'] if row and row['max_id'] else ""
+            version = node_count * 1000000
+            if max_node_id:
+                try:
+                    nums = [int(s) for s in max_node_id.replace('n_', '').split('_') if s.isdigit()]
+                    for n in nums:
+                        version += n
+                except (ValueError, AttributeError):
+                    pass
+
+            # 包含边的变更信息：边数量 + 最大边ID
+            cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(id) as max_id FROM edges")
+            row = cursor.fetchone()
+            edge_count = row['cnt'] if row else 0
+            max_edge_id = row['max_id'] if row and row['max_id'] else 0
+            version += edge_count * 10000 + (max_edge_id or 0)
+
+            return version
+        except Exception as e:
+            logger.warning(f"获取数据库版本号失败: {e}")
             return 0
     
-    def _sync_from_db(self):
-        """从数据库同步最新数据到内存图（多实例共享时调用）"""
+    def _check_need_sync(self) -> int:
+        """无锁检查版本号，返回当前数据库版本（调用方无需持有锁）"""
+        return self._get_db_version()
+
+    def _do_sync(self):
+        """执行实际同步（调用方必须已持有 self._lock）"""
         current_version = self._get_db_version()
         if current_version == self._last_sync_version:
             return  # 无需同步
-        
-        with self._lock:
-            conn = self._get_conn()
-            
-            # 获取数据库中所有节点ID
-            db_node_ids = set()
-            cursor = conn.execute("SELECT id FROM nodes")
-            for row in cursor:
-                db_node_ids.add(row['id'])
-            
-            # 获取内存图中的节点ID
-            mem_node_ids = set(self._graph.nodes())
-            
-            # 添加新节点
-            new_ids = db_node_ids - mem_node_ids
-            if new_ids:
-                placeholders = ','.join('?' * len(new_ids))
-                cursor = conn.execute(f"SELECT * FROM nodes WHERE id IN ({placeholders})", list(new_ids))
+
+        conn = self._get_conn()
+
+        # 获取数据库中所有节点ID
+        db_node_ids = set()
+        cursor = conn.execute("SELECT id FROM nodes")
+        for row in cursor:
+            db_node_ids.add(row['id'])
+
+        # 获取内存图中的节点ID
+        mem_node_ids = set(self._graph.nodes())
+
+        # 添加新节点（分批处理，避免超过 SQLITE_MAX_VARIABLE_NUMBER）
+        new_ids = db_node_ids - mem_node_ids
+        if new_ids:
+            new_ids_list = list(new_ids)
+            batch_size = 900
+            for i in range(0, len(new_ids_list), batch_size):
+                batch = new_ids_list[i:i + batch_size]
+                placeholders = ','.join('?' * len(batch))
+                cursor = conn.execute(f"SELECT * FROM nodes WHERE id IN ({placeholders})", batch)
                 for row in cursor:
                     node = KnowledgeNode(
                         id=row['id'], title=row['title'], content=row['content'],
@@ -138,42 +163,62 @@ class KnowledgeGraph:
                         importance=row['importance']
                     )
                     self._graph.add_node(node.id, **asdict(node))
-            
-            # 删除已移除的节点
-            removed_ids = mem_node_ids - db_node_ids
-            for node_id in removed_ids:
-                if node_id in self._graph:
-                    self._graph.remove_node(node_id)
-            
-            # 同步边
-            db_edges = set()
-            cursor = conn.execute("SELECT source, target, relation FROM edges")
-            for row in cursor:
-                db_edges.add((row['source'], row['target'], row['relation']))
-            
-            mem_edges = set()
-            for u, v, data in self._graph.edges(data=True):
-                mem_edges.add((u, v, data.get('relation', 'related_to')))
-            
-            # 添加新边
-            for source, target, relation in db_edges - mem_edges:
-                if source in self._graph and target in self._graph:
-                    cursor = conn.execute(
-                        "SELECT * FROM edges WHERE source=? AND target=? AND relation=?",
-                        (source, target, relation)
+
+        # 删除已移除的节点
+        removed_ids = mem_node_ids - db_node_ids
+        for node_id in removed_ids:
+            if node_id in self._graph:
+                self._graph.remove_node(node_id)
+
+        # 同步边
+        db_edges = set()
+        cursor = conn.execute("SELECT source, target, relation FROM edges")
+        for row in cursor:
+            db_edges.add((row['source'], row['target'], row['relation']))
+
+        mem_edges = set()
+        for u, v, data in self._graph.edges(data=True):
+            mem_edges.add((u, v, data.get('relation', 'related_to')))
+
+        # 添加新边
+        for source, target, relation in db_edges - mem_edges:
+            if source in self._graph and target in self._graph:
+                cursor = conn.execute(
+                    "SELECT * FROM edges WHERE source=? AND target=? AND relation=?",
+                    (source, target, relation)
+                )
+                row = cursor.fetchone()
+                if row:
+                    self._graph.add_edge(
+                        source, target,
+                        relation=row['relation'], weight=row['weight'],
+                        metadata=json.loads(row['metadata']),
+                        created_at=row['created_at']
                     )
-                    row = cursor.fetchone()
-                    if row:
-                        self._graph.add_edge(
-                            source, target,
-                            relation=row['relation'], weight=row['weight'],
-                            metadata=json.loads(row['metadata']),
-                            created_at=row['created_at']
-                        )
-            
-            self._last_sync_version = current_version
-            if new_ids or removed_ids or (db_edges != mem_edges):
-                logger.debug(f"知识图谱同步: +{len(new_ids)}节点 -{len(removed_ids)}节点, 边变化{len(db_edges - mem_edges)}")
+
+        self._last_sync_version = current_version
+        if new_ids or removed_ids or (db_edges != mem_edges):
+            logger.debug(f"知识图谱同步: +{len(new_ids)}节点 -{len(removed_ids)}节点, 边变化{len(db_edges - mem_edges)}")
+
+    def _sync_and_lock(self):
+        """上下文管理器：获取锁 -> 检查版本 -> 如需同步则同步 -> 遍历图 -> 释放锁
+        消除 TOCTOU 竞态：整个同步和图遍历在同一个锁保护下完成"""
+        class _SyncLockContext:
+            def __init__(self, kg):
+                self._kg = kg
+            def __enter__(self):
+                self._kg._lock.acquire()
+                self._kg._do_sync()
+                return self._kg
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self._kg._lock.release()
+                return False
+        return _SyncLockContext(self)
+
+    def _sync_from_db(self):
+        """从数据库同步最新数据到内存图（多实例共享时调用，向后兼容）"""
+        with self._lock:
+            self._do_sync()
     
     def _init_db(self):
         """初始化数据库表结构"""
@@ -242,11 +287,11 @@ class KnowledgeGraph:
     # ---- 节点操作 ----
     
     def add_node(self, node: KnowledgeNode) -> str:
-        """添加知识节点（线程安全）"""
+        """添加知识节点（线程安全），已存在的节点不会被覆盖"""
         with self._lock:
             conn = self._get_conn()
             conn.execute(
-                """INSERT OR REPLACE INTO nodes 
+                """INSERT OR IGNORE INTO nodes 
                    (id, title, content, category, tags, metadata, created_at, updated_at, importance)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (node.id, node.title, node.content, node.category,
@@ -261,43 +306,46 @@ class KnowledgeGraph:
     
     def get_node(self, node_id: str) -> Optional[Dict]:
         """获取节点"""
-        self._sync_from_db()  # 多实例同步
-        if node_id in self._graph:
-            return dict(self._graph.nodes[node_id])
-        return None
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            if node_id in self._graph:
+                return dict(self._graph.nodes[node_id])
+            return None
     
     def search_nodes(self, query: str, category: Optional[str] = None, 
                      limit: int = 20) -> List[Dict]:
         """搜索节点 - 基于关键词匹配"""
-        self._sync_from_db()  # 多实例同步
-        results = []
-        query_lower = query.lower()
-        
-        for node_id, data in self._graph.nodes(data=True):
-            if category and data.get('category') != category:
-                continue
-            # 标题、内容、标签匹配
-            score = 0
-            if query_lower in data.get('title', '').lower():
-                score += 3
-            if query_lower in data.get('content', '').lower():
-                score += 1
-            for tag in data.get('tags', []):
-                if query_lower in tag.lower():
-                    score += 2
-            if score > 0:
-                results.append((score, dict(data)))
-        
-        results.sort(key=lambda x: -x[0])
-        return [r[1] for r in results[:limit]]
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            results = []
+            query_lower = query.lower()
+            
+            for node_id, data in self._graph.nodes(data=True):
+                if category and data.get('category') != category:
+                    continue
+                # 标题、内容、标签匹配
+                score = 0
+                if query_lower in data.get('title', '').lower():
+                    score += 3
+                if query_lower in data.get('content', '').lower():
+                    score += 1
+                for tag in data.get('tags', []):
+                    if query_lower in tag.lower():
+                        score += 2
+                if score > 0:
+                    results.append((score, dict(data)))
+            
+            results.sort(key=lambda x: -x[0])
+            return [r[1] for r in results[:limit]]
     
     def get_nodes_by_category(self, category: str) -> List[Dict]:
         """按类别获取节点"""
-        self._sync_from_db()  # 多实例同步
-        return [
-            dict(data) for _, data in self._graph.nodes(data=True)
-            if data.get('category') == category
-        ]
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            return [
+                dict(data) for _, data in self._graph.nodes(data=True)
+                if data.get('category') == category
+            ]
     
     def delete_node(self, node_id: str) -> bool:
         """删除节点及其关联边（线程安全）"""
@@ -343,74 +391,78 @@ class KnowledgeGraph:
     
     def get_neighbors(self, node_id: str, relation: Optional[str] = None) -> List[Dict]:
         """获取邻居节点"""
-        self._sync_from_db()  # 多实例同步
-        if node_id not in self._graph:
-            return []
-        neighbors = []
-        for neighbor_id in self._graph.neighbors(node_id):
-            edge_data = self._graph.edges[node_id, neighbor_id]
-            if relation and edge_data.get('relation') != relation:
-                continue
-            neighbor_data = dict(self._graph.nodes[neighbor_id])
-            neighbor_data['_relation'] = edge_data.get('relation')
-            neighbor_data['_weight'] = edge_data.get('weight', 1.0)
-            neighbors.append(neighbor_data)
-        return neighbors
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            if node_id not in self._graph:
+                return []
+            neighbors = []
+            for neighbor_id in self._graph.neighbors(node_id):
+                edge_data = self._graph.edges[node_id, neighbor_id]
+                if relation and edge_data.get('relation') != relation:
+                    continue
+                neighbor_data = dict(self._graph.nodes[neighbor_id])
+                neighbor_data['_relation'] = edge_data.get('relation')
+                neighbor_data['_weight'] = edge_data.get('weight', 1.0)
+                neighbors.append(neighbor_data)
+            return neighbors
     
     # ---- 图查询 ----
     
     def find_path(self, source: str, target: str) -> Optional[List[str]]:
         """查找两个节点之间的最短路径"""
-        self._sync_from_db()  # 多实例同步
-        try:
-            return nx.shortest_path(self._graph, source, target)
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return None
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            try:
+                return nx.shortest_path(self._graph, source, target)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None
     
     def get_related_knowledge(self, node_id: str, max_depth: int = 2) -> Dict:
         """获取与某节点相关的知识子图"""
-        self._sync_from_db()  # 多实例同步
-        if node_id not in self._graph:
-            return {"nodes": [], "edges": []}
-        
-        # BFS 获取子图
-        subgraph_nodes = set()
-        queue = [(node_id, 0)]
-        while queue:
-            current, depth = queue.pop(0)
-            if depth > max_depth:
-                continue
-            subgraph_nodes.add(current)
-            for neighbor in self._graph.neighbors(current):
-                if neighbor not in subgraph_nodes:
-                    queue.append((neighbor, depth + 1))
-        
-        nodes = [dict(self._graph.nodes[n]) for n in subgraph_nodes]
-        edges = [
-            {
-                "source": u, "target": v,
-                "relation": self._graph.edges[u, v].get('relation'),
-                "weight": self._graph.edges[u, v].get('weight', 1.0)
-            }
-            for u, v in self._graph.edges(subgraph_nodes)
-        ]
-        
-        return {"nodes": nodes, "edges": edges}
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            if node_id not in self._graph:
+                return {"nodes": [], "edges": []}
+            
+            # BFS 获取子图
+            subgraph_nodes = set()
+            queue = [(node_id, 0)]
+            while queue:
+                current, depth = queue.pop(0)
+                if depth > max_depth:
+                    continue
+                subgraph_nodes.add(current)
+                for neighbor in self._graph.neighbors(current):
+                    if neighbor not in subgraph_nodes:
+                        queue.append((neighbor, depth + 1))
+            
+            nodes = [dict(self._graph.nodes[n]) for n in subgraph_nodes]
+            edges = [
+                {
+                    "source": u, "target": v,
+                    "relation": self._graph.edges[u, v].get('relation'),
+                    "weight": self._graph.edges[u, v].get('weight', 1.0)
+                }
+                for u, v in self._graph.edges(subgraph_nodes)
+            ]
+            
+            return {"nodes": nodes, "edges": edges}
     
     def get_stats(self) -> Dict:
         """获取图谱统计信息"""
-        self._sync_from_db()  # 多实例同步
-        categories = {}
-        for _, data in self._graph.nodes(data=True):
-            cat = data.get('category', 'unknown')
-            categories[cat] = categories.get(cat, 0) + 1
-        
-        return {
-            "total_nodes": self._graph.number_of_nodes(),
-            "total_edges": self._graph.number_of_edges(),
-            "categories": categories,
-            "db_size_bytes": os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
-        }
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        with self._sync_and_lock():
+            categories = {}
+            for _, data in self._graph.nodes(data=True):
+                cat = data.get('category', 'unknown')
+                categories[cat] = categories.get(cat, 0) + 1
+            
+            return {
+                "total_nodes": self._graph.number_of_nodes(),
+                "total_edges": self._graph.number_of_edges(),
+                "categories": categories,
+                "db_size_bytes": os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            }
     
     # ---- 经验管理（高级接口）----
     
@@ -428,14 +480,15 @@ class KnowledgeGraph:
         )
         node_id = self.add_node(node)
         
-        # 建立关联
+        # 建立关联（在锁内读取 _graph 防止竞态）
         if related_to:
-            for rel_id in related_to:
-                if rel_id in self._graph:
-                    self.add_edge(KnowledgeEdge(
-                        source=node_id, target=rel_id,
-                        relation="related_to"
-                    ))
+            with self._lock:
+                for rel_id in related_to:
+                    if rel_id in self._graph:
+                        self.add_edge(KnowledgeEdge(
+                            source=node_id, target=rel_id,
+                            relation="related_to"
+                        ))
         
         return node_id
     
@@ -483,34 +536,66 @@ class KnowledgeGraph:
     
     def get_relevant_context(self, task_description: str) -> str:
         """为任务获取相关上下文 - Agent 执行前的关键步骤"""
-        self._sync_from_db()  # 多实例同步
-        # 搜索相关经验
-        experiences = self.search_nodes(task_description, limit=5)
-        methods = self.search_nodes(task_description, category="method", limit=3)
-        errors = self.search_nodes(task_description, category="error", limit=3)
-        
-        context_parts = []
-        
-        if experiences:
-            context_parts.append("=== 相关经验 ===")
-            for exp in experiences:
-                context_parts.append(f"- {exp.get('title')}: {exp.get('content', '')[:200]}")
-        
-        if methods:
-            context_parts.append("\n=== 相关方法 ===")
-            for m in methods:
-                context_parts.append(f"- {m.get('title')}: {m.get('content', '')[:200]}")
-        
-        if errors:
-            context_parts.append("\n=== 历史错误(避免重犯) ===")
-            for e in errors:
-                context_parts.append(f"- {e.get('title')}: {e.get('content', '')[:200]}")
-        
-        return "\n".join(context_parts) if context_parts else "暂无相关经验"
+        # [修复1] 使用 _sync_and_lock 上下文管理器保护读操作
+        # 注意：不能在锁内调用 self.search_nodes()，因为 search_nodes 也会
+        # 调用 _sync_and_lock() 尝试获取同一个不可重入锁，会导致死锁。
+        # 因此直接在锁内执行搜索逻辑。
+        with self._sync_and_lock():
+            query_lower = task_description.lower()
+
+            def _do_search(category=None, limit=5):
+                results = []
+                for node_id, data in self._graph.nodes(data=True):
+                    if category and data.get('category') != category:
+                        continue
+                    score = 0
+                    if query_lower in data.get('title', '').lower():
+                        score += 3
+                    if query_lower in data.get('content', '').lower():
+                        score += 1
+                    for tag in data.get('tags', []):
+                        if query_lower in tag.lower():
+                            score += 2
+                    if score > 0:
+                        results.append((score, dict(data)))
+                results.sort(key=lambda x: -x[0])
+                return [r[1] for r in results[:limit]]
+
+            experiences = _do_search(limit=5)
+            methods = _do_search(category="method", limit=3)
+            errors = _do_search(category="error", limit=3)
+            
+            context_parts = []
+            
+            if experiences:
+                context_parts.append("=== 相关经验 ===")
+                for exp in experiences:
+                    context_parts.append(f"- {exp.get('title')}: {exp.get('content', '')[:200]}")
+            
+            if methods:
+                context_parts.append("\n=== 相关方法 ===")
+                for m in methods:
+                    context_parts.append(f"- {m.get('title')}: {m.get('content', '')[:200]}")
+            
+            if errors:
+                context_parts.append("\n=== 历史错误(避免重犯) ===")
+                for e in errors:
+                    context_parts.append(f"- {e.get('title')}: {e.get('content', '')[:200]}")
+            
+            return "\n".join(context_parts) if context_parts else "暂无相关经验"
     
     def close(self):
         """关闭数据库连接"""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-            logger.info("知识图谱数据库连接已关闭")
+        # [修复4] 在 close() 中获取 self._lock，防止与其他线程的读写操作并发
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+                logger.info("知识图谱数据库连接已关闭")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False

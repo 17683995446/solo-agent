@@ -66,6 +66,7 @@ class KeepAliveScheduler:
         
         # 线程锁
         self._lock = threading.Lock()
+        self._stats_lock = threading.Lock()
         
         # 注册信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -101,15 +102,21 @@ class KeepAliveScheduler:
     def add_tasks(self, tasks: List[Dict]) -> int:
         """批量添加任务"""
         count = 0
-        for t in tasks:
-            self.add_task(
-                name=t.get("name", ""),
-                description=t.get("description", ""),
-                task_type=t.get("task_type", "general"),
-                params=t.get("params", {}),
-                priority=t.get("priority", 0)
+        with self._lock:
+            for t in tasks:
+                task = Task(
+                    name=t.get("name", ""),
+                    description=t.get("description", ""),
+                    task_type=t.get("task_type", "general"),
+                    params=t.get("params", {}),
+                    priority=t.get("priority", 0)
+                )
+                self._task_queue.append(task)
+                count += 1
+            # 批量添加后只排序一次
+            self._task_queue = deque(
+                sorted(self._task_queue, key=lambda t: -t.priority)
             )
-            count += 1
         return count
     
     def get_queue_size(self) -> int:
@@ -175,7 +182,8 @@ class KeepAliveScheduler:
         while self._running:
             cycle_start = time.time()
             self._cycle_count += 1
-            self._stats["total_cycles"] += 1
+            with self._stats_lock:
+                self._stats["total_cycles"] += 1
             
             try:
                 if self._paused:
@@ -194,7 +202,8 @@ class KeepAliveScheduler:
                 
             except Exception as e:
                 logger.error(f"循环 #{self._cycle_count} 异常: {e}", exc_info=True)
-                self._stats["auto_recoveries"] += 1
+                with self._stats_lock:
+                    self._stats["auto_recoveries"] += 1
             
             # 只在无任务时才等待（有任务时立即处理下一个）
             if self.get_queue_size() == 0:
@@ -227,9 +236,11 @@ class KeepAliveScheduler:
                     self._completed_tasks = self._completed_tasks[-500:]
             
             if result.status == TaskStatus.SUCCESS.value:
-                self._stats["tasks_completed"] += 1
+                with self._stats_lock:
+                    self._stats["tasks_completed"] += 1
             else:
-                self._stats["tasks_failed"] += 1
+                with self._stats_lock:
+                    self._stats["tasks_failed"] += 1
             
             # 立即反思（优化线的一部分）
             self.optimizer.reflect_on_task(task_dict)
@@ -247,7 +258,9 @@ class KeepAliveScheduler:
                 try:
                     logger.info("━━━ 优化线 ━━━ 执行深度反思...")
                     reflection = self.optimizer.deep_reflection()
-                    self._stats["optimizations"] += 1
+                    # Bug修复: 后台线程修改 _stats 时使用 _stats_lock 保护，防止竞态条件
+                    with self._stats_lock:
+                        self._stats["optimizations"] += 1
                     logger.info(f"深度反思完成:\n{reflection[:500]}")
                 except Exception as e:
                     logger.error(f"深度反思失败: {e}")
@@ -262,7 +275,7 @@ class KeepAliveScheduler:
                 stats = self.kg.get_stats()
                 logger.debug(
                     f"━━━ 知识线 ━━━ 图谱状态: "
-                    f"{stats['total_nodes']} 节点, {stats['total_edges']} 边"
+                    f"{stats.get('total_nodes', 0)} 节点, {stats.get('total_edges', 0)} 边"
                 )
             except Exception as e:
                 logger.debug(f"知识线检查失败: {e}")
@@ -302,25 +315,43 @@ class KeepAliveScheduler:
             logger.debug(f"  空闲改进失败: {e}")
     
     def _auto_recover(self, error: Exception):
-        """自动恢复 - 崩溃后自动重启"""
+        """
+        自动恢复 - 崩溃后自动重启
+        Bug修复: 将递归调用 _main_loop 改为 while True 循环，防止栈溢出
+        Bug修复: 在设置 _running=True 前检查是否已被外部停止（如信号处理调用了 stop()）
+        """
         logger.warning("🔄 触发自动恢复机制...")
-        self._stats["auto_recoveries"] += 1
-        
-        # 短暂等待
-        time.sleep(3)
-        
-        # 尝试重新初始化关键模块
-        try:
-            if self.kg:
-                logger.info("  重新连接知识图谱...")
-                # 知识图谱已有持久化，无需重新初始化
-            
-            logger.info("  恢复完成，重新启动主循环...")
-            self._running = True
-            self._main_loop()
-        except Exception as e2:
-            logger.critical(f"自动恢复失败: {e2}")
-            raise
+        with self._stats_lock:
+            self._stats["auto_recoveries"] += 1
+
+        # Bug修复: 使用 while True 循环代替递归调用 _main_loop，避免栈溢出
+        while True:
+            # 短暂等待
+            time.sleep(3)
+
+            # Bug修复: 恢复前检查是否已被外部停止（例如 stop() 已被调用）
+            if not self._running:
+                logger.info("  自动恢复取消: Agent 已被外部停止")
+                return
+
+            # 尝试重新初始化关键模块并重启主循环
+            try:
+                if self.kg:
+                    logger.info("  重新连接知识图谱...")
+                    # 知识图谱已有持久化，无需重新初始化
+
+                logger.info("  恢复完成，重新启动主循环...")
+                self._running = True
+                self._main_loop()
+                # _main_loop 正常返回（_running 被设为 False），退出恢复循环
+                return
+            except Exception as e2:
+                logger.critical(f"自动恢复失败: {e2}")
+                # Bug修复: 循环重试而非递归，检查是否应继续恢复
+                if not self._running:
+                    logger.info("  自动恢复终止: Agent 已被外部停止")
+                    return
+                # 继续循环，下一次迭代将再次尝试恢复
     
     def _shutdown(self):
         """优雅关闭 - 不关闭共享的知识图谱（由创建者管理生命周期）"""
@@ -341,14 +372,19 @@ class KeepAliveScheduler:
                     tags=["stats", "runtime"],
                     importance=0.3
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"保存运行统计失败: {e}")
         
         # 不关闭知识图谱 - 它是共享资源，由创建者负责关闭
         logger.info("优雅关闭完成")
     
     # ---- 状态查询 ----
     
+    def get_stats_snapshot(self) -> Dict:
+        """获取统计快照（线程安全）"""
+        with self._stats_lock:
+            return dict(self._stats)
+
     def get_status(self) -> Dict:
         """获取 Agent 当前状态"""
         uptime = time.time() - self._start_time if self._start_time else 0
@@ -363,7 +399,7 @@ class KeepAliveScheduler:
             "queue_size": self.get_queue_size(),
             "completed_tasks": completed_count,
             "uptime_seconds": round(uptime, 1),
-            "stats": dict(self._stats),
+            "stats": self.get_stats_snapshot(),
             "executor_stats": self.executor.get_stats(),
             "optimizer_stats": self.optimizer.get_stats()
         }

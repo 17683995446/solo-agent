@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import logging
+import threading
 import importlib
 import importlib.util
 import types  # ★ 新增：用于热更新时创建模块
@@ -40,7 +41,8 @@ class PluginInterface(ABC):
     """
     
     def __init__(self, config: Dict = None):
-        self.config = config or {}
+        # Bug修复 #3: config={} 被丢弃 — 使用 is not None 而非 or，保留空字典
+        self.config = config if config is not None else {}
         self._initialized = False
     
     @abstractmethod
@@ -86,7 +88,8 @@ class PluginManager:
     """
     
     def __init__(self, plugin_dirs: List[str] = None):
-        self.plugin_dirs = plugin_dirs or ["plugins", "~/.solo_agent/plugins"]
+        self._lock = threading.RLock()
+        self.plugin_dirs = plugin_dirs if plugin_dirs is not None else ["plugins", "~/.solo_agent/plugins"]
         self._plugins: Dict[str, PluginInterface] = {}  # name -> instance
         self._handlers: Dict[str, Callable] = {}  # task_type -> execute function
         self._metadata: Dict[str, PluginInfo] = {}  # name -> info
@@ -99,16 +102,17 @@ class PluginManager:
     
     def discover_plugins(self) -> List[Path]:
         """发现所有可用插件"""
-        discovered = []
-        for plugin_dir in self.plugin_dirs:
-            if not os.path.exists(plugin_dir):
-                continue
-            for item in Path(plugin_dir).iterdir():
-                if item.is_dir() and (item / "plugin.json").exists():
-                    discovered.append(item)
-                elif item.suffix == ".py" and item.stem != "__init__":
-                    discovered.append(item)
-        return discovered
+        with self._lock:
+            discovered = []
+            for plugin_dir in self.plugin_dirs:
+                if not os.path.exists(plugin_dir):
+                    continue
+                for item in Path(plugin_dir).iterdir():
+                    if item.is_dir() and (item / "plugin.json").exists():
+                        discovered.append(item)
+                    elif item.suffix == ".py" and item.stem != "__init__":
+                        discovered.append(item)
+            return discovered
     
     def load_plugin(self, plugin_path) -> Optional[str]:
         """
@@ -136,9 +140,10 @@ class PluginManager:
         
         info = PluginInfo(**manifest)
         
-        if info.name in self._plugins:
-            logger.warning(f"插件 {info.name} 已存在，跳过")
-            return None
+        with self._lock:
+            if info.name in self._plugins:
+                logger.warning(f"插件 {info.name} 已存在，跳过")
+                return None
         
         # 动态导入
         init_file = plugin_dir / "__init__.py"
@@ -148,6 +153,10 @@ class PluginManager:
         spec = importlib.util.spec_from_file_location(
             f"plugin_{info.name}", init_file
         )
+        # Bug修复 #2: 入口文件不存在时 spec 为 None，需要防御性检查
+        if spec is None:
+            logger.error(f"无法为插件 {info.name} 创建模块规格，入口文件: {init_file}")
+            return None
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
@@ -160,8 +169,10 @@ class PluginManager:
             logger.error(f"插件 {info.name} 初始化失败")
             return None
         
-        self._plugins[info.name] = instance
-        self._metadata[info.name] = info
+        with self._lock:
+            self._plugins[info.name] = instance
+            self._metadata[info.name] = info
+            self._module_names[info.name] = spec.name
         
         # 注册任务处理器
         self._register_handlers(instance)
@@ -179,7 +190,7 @@ class PluginManager:
         module.__file__ = str(plugin_file)
         sys.modules[module_name] = module
         
-        # 读取并执行文件内容
+        # 读取并执行文件内容（耗时操作，不在锁内执行）
         with open(plugin_file, 'r', encoding='utf-8') as f:
             code = f.read()
         exec(compile(code, str(plugin_file), 'exec'), module.__dict__)
@@ -201,17 +212,21 @@ class PluginManager:
         instance = plugin_class()
         info = instance.get_info()
         
-        if info.name in self._plugins:
-            logger.warning(f"插件 {info.name} 已存在，跳过")
-            return None
+        with self._lock:
+            if info.name in self._plugins:
+                logger.warning(f"插件 {info.name} 已存在，跳过")
+                return None
         
         if not instance.initialize():
             logger.error(f"插件 {info.name} 初始化失败")
             return None
         
-        self._plugins[info.name] = instance
-        self._metadata[info.name] = info
-        self._module_names[info.name] = module_name  # ★ 存储模块名用于热更新清理
+        with self._lock:
+            self._plugins[info.name] = instance
+            self._metadata[info.name] = info
+            self._module_names[info.name] = module_name  # ★ 存储模块名用于热更新清理
+        
+        # 注册任务处理器
         self._register_handlers(instance)
         
         logger.info(f"✓ 插件加载成功: {info.name} v{info.version}")
@@ -220,46 +235,48 @@ class PluginManager:
     def _register_handlers(self, plugin: PluginInterface):
         """注册插件的任务处理器"""
         info = plugin.get_info()
-        # 使用插件名作为任务类型
-        self._handlers[info.name] = plugin.execute
-        
-        # 插件可以注册多个别名
-        aliases = plugin.config.get("aliases", [])
-        for alias in aliases:
-            self._handlers[alias] = plugin.execute
+        with self._lock:
+            # 使用插件名作为任务类型
+            self._handlers[info.name] = plugin.execute
+            
+            # 插件可以注册多个别名
+            aliases = plugin.config.get("aliases", [])
+            for alias in aliases:
+                self._handlers[alias] = plugin.execute
     
     def unload_plugin(self, name: str) -> bool:
         """卸载插件"""
-        if name not in self._plugins:
-            return False
-        
-        plugin = self._plugins[name]
-        info = plugin.get_info()
-        
-        # 注销处理器
-        handlers_to_remove = [info.name] + plugin.config.get("aliases", [])
-        for handler_name in handlers_to_remove:
-            if handler_name in self._handlers:
-                del self._handlers[handler_name]
-        
-        # 关闭插件
-        plugin.shutdown()
-        
-        # ★ Bug修复：清理sys.modules中的模块缓存，确保热更新时重新加载
-        # 使用实际存储的模块名（单文件插件是 plugin_{stem}，包插件是 plugin_{name}）
-        module_name = self._module_names.get(name)
-        if module_name and module_name in sys.modules:
-            del sys.modules[module_name]
-        # 同时清理可能的变体
-        for key in list(sys.modules.keys()):
-            if key == module_name or (module_name and key.startswith(module_name + "_")):
-                del sys.modules[key]
-        
-        # 清理
-        del self._plugins[name]
-        del self._metadata[name]
-        if name in self._module_names:
-            del self._module_names[name]
+        with self._lock:
+            if name not in self._plugins:
+                return False
+            
+            plugin = self._plugins[name]
+            info = plugin.get_info()
+            
+            # 注销处理器
+            handlers_to_remove = [info.name] + plugin.config.get("aliases", [])
+            for handler_name in handlers_to_remove:
+                if handler_name in self._handlers:
+                    del self._handlers[handler_name]
+            
+            # 关闭插件
+            plugin.shutdown()
+            
+            # ★ Bug修复：清理sys.modules中的模块缓存，确保热更新时重新加载
+            # 使用实际存储的模块名（单文件插件是 plugin_{stem}，包插件是 plugin_{name}）
+            module_name = self._module_names.get(name)
+            if module_name and module_name in sys.modules:
+                del sys.modules[module_name]
+            # 同时清理可能的变体
+            for key in list(sys.modules.keys()):
+                if key == module_name or (module_name and key.startswith(module_name + "_")):
+                    del sys.modules[key]
+            
+            # 清理
+            del self._plugins[name]
+            del self._metadata[name]
+            if name in self._module_names:
+                del self._module_names[name]
         
         logger.info(f"✓ 插件已卸载: {name}")
         return True
@@ -282,20 +299,22 @@ class PluginManager:
     
     def get_handler(self, task_type: str) -> Optional[Callable]:
         """获取任务处理器"""
-        return self._handlers.get(task_type)
+        with self._lock:
+            return self._handlers.get(task_type)
     
     def list_plugins(self) -> List[Dict]:
         """列出所有插件"""
-        return [
-            {
-                "name": name,
-                "version": info.version,
-                "description": info.description,
-                "enabled": info.enabled,
-                "handlers": [name] + self._plugins[name].config.get("aliases", [])
-            }
-            for name, info in self._metadata.items()
-        ]
+        with self._lock:
+            return [
+                {
+                    "name": name,
+                    "version": info.version,
+                    "description": info.description,
+                    "enabled": info.enabled,
+                    "handlers": [name] + self._plugins[name].config.get("aliases", [])
+                }
+                for name, info in self._metadata.items()
+            ]
     
     def load_all(self):
         """加载所有发现的插件"""
@@ -399,28 +418,36 @@ class DatabasePlugin(PluginInterface):
         if not query:
             return {"error": "缺少查询语句"}
         
+        # 路径验证：只允许 data/ 目录下
+        db_path = os.path.normpath(db_path)
+        if not db_path.startswith("data" + os.sep) and db_path != "data" and not db_path.startswith("data/"):
+            return {"error": f"数据库路径不合法，只允许 data/ 目录下: {db_path}"}
+        
+        # SQL安全检查：只允许 SELECT 语句
+        stripped = query.strip()
+        if not stripped.upper().startswith("SELECT"):
+            return {"error": "安全限制：只允许 SELECT 查询语句"}
+        
         try:
-            conn = sqlite3.connect(db_path)
+            conn = None
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(query)
             
-            if query.strip().upper().startswith("SELECT"):
-                results = [dict(row) for row in cursor.fetchall()]
-                return {"results": results, "count": len(results)}
-            else:
-                conn.commit()
-                return {"affected_rows": cursor.rowcount}
+            results = [dict(row) for row in cursor.fetchall()]
+            return {"results": results, "count": len(results)}
                 
         except Exception as e:
             return {"error": str(e)}
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
     
     def shutdown(self):
         """关闭所有连接"""
         for conn in self._connections.values():
             try:
                 conn.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"关闭数据库连接失败: {e}")
         self._connections.clear()
