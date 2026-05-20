@@ -10,6 +10,7 @@ import json
 import logging
 import importlib
 import importlib.util
+import types  # ★ 新增：用于热更新时创建模块
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
@@ -89,6 +90,7 @@ class PluginManager:
         self._plugins: Dict[str, PluginInterface] = {}  # name -> instance
         self._handlers: Dict[str, Callable] = {}  # task_type -> execute function
         self._metadata: Dict[str, PluginInfo] = {}  # name -> info
+        self._module_names: Dict[str, str] = {}  # name -> module_name (for hot reload cleanup)
         
         # 展开用户目录
         self.plugin_dirs = [
@@ -169,12 +171,18 @@ class PluginManager:
     
     def _load_single_file_plugin(self, plugin_file: Path) -> Optional[str]:
         """加载单文件插件（简化格式）"""
-        spec = importlib.util.spec_from_file_location(
-            f"plugin_{plugin_file.stem}", plugin_file
-        )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module_name = f"plugin_{plugin_file.stem}"
+        
+        # ★ Bug修复：使用exec()直接执行代码，避免importlib的文件缓存问题
+        # 这对于热更新场景至关重要
+        module = types.ModuleType(module_name)
+        module.__file__ = str(plugin_file)
+        sys.modules[module_name] = module
+        
+        # 读取并执行文件内容
+        with open(plugin_file, 'r', encoding='utf-8') as f:
+            code = f.read()
+        exec(compile(code, str(plugin_file), 'exec'), module.__dict__)
         
         # 查找插件类（继承PluginInterface）
         plugin_class = None
@@ -203,6 +211,7 @@ class PluginManager:
         
         self._plugins[info.name] = instance
         self._metadata[info.name] = info
+        self._module_names[info.name] = module_name  # ★ 存储模块名用于热更新清理
         self._register_handlers(instance)
         
         logger.info(f"✓ 插件加载成功: {info.name} v{info.version}")
@@ -236,9 +245,21 @@ class PluginManager:
         # 关闭插件
         plugin.shutdown()
         
+        # ★ Bug修复：清理sys.modules中的模块缓存，确保热更新时重新加载
+        # 使用实际存储的模块名（单文件插件是 plugin_{stem}，包插件是 plugin_{name}）
+        module_name = self._module_names.get(name)
+        if module_name and module_name in sys.modules:
+            del sys.modules[module_name]
+        # 同时清理可能的变体
+        for key in list(sys.modules.keys()):
+            if key == module_name or (module_name and key.startswith(module_name + "_")):
+                del sys.modules[key]
+        
         # 清理
         del self._plugins[name]
         del self._metadata[name]
+        if name in self._module_names:
+            del self._module_names[name]
         
         logger.info(f"✓ 插件已卸载: {name}")
         return True
