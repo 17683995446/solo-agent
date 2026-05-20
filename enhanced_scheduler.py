@@ -488,7 +488,18 @@ class EnhancedScheduler:
                     with self._lock:
                         if not self._ready_queue and not self._running_tasks:
                             break
-                time.sleep(self._schedule_check_interval)
+                # ★ 性能优化：有运行中任务时用短间隔，空闲时用长间隔
+                with self._lock:
+                    has_running = len(self._running_tasks) > 0
+                    has_pending = len(self._ready_queue) > 0 or any(
+                        t.state == TaskState.PENDING for t in self._tasks.values()
+                    )
+                if has_running:
+                    time.sleep(0.01)  # 有任务运行中，快速检查
+                elif has_pending:
+                    time.sleep(self._schedule_check_interval)  # 有待处理任务
+                else:
+                    time.sleep(self._schedule_check_interval)  # 真正空闲
             # 如果启动了任务，立即回到循环顶部检查是否还能启动更多
         
         logger.info("增强调度器已停止")
