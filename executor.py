@@ -297,9 +297,10 @@ class TaskExecutor:
                 break
             
             # LLM连续失败不重试（API不可用时重试无意义）
-            if self.llm and self.llm._error_count > 0:
+            if self.llm and self.llm.get_stats().get("error_count", 0) > 0:
                 if "LLM 返回空结果" in task.error or "LLM" in task.error:
-                    logger.info(f"  ⊘ 跳过重试: LLM服务不可用 (连续{self.llm._error_count}次错误)")
+                    error_count = self.llm.get_stats().get("error_count", 0)
+                    logger.info(f"  ⊘ 跳过重试: LLM服务不可用 (连续{error_count}次错误)")
                     break
         
         if task.status != TaskStatus.SUCCESS.value:

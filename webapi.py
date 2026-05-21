@@ -56,8 +56,11 @@ class WebAPI:
         def get_tasks():
             """获取任务列表"""
             task_type = request.args.get('type')  # pending, completed, recent
-            limit = int(request.args.get('limit', 20))
-            
+            try:
+                limit = max(1, min(int(request.args.get('limit', 20)), 100))
+            except (ValueError, TypeError):
+                limit = 20
+
             if task_type == 'pending':
                 tasks = self.scheduler.get_pending_tasks()
             elif task_type == 'completed':
@@ -70,8 +73,8 @@ class WebAPI:
         @self.app.route('/api/tasks', methods=['POST'])
         def add_task():
             """添加任务"""
-            data = request.get_json(force=True)
-            if not data:
+            data = request.get_json(silent=True)
+            if not data or not isinstance(data, dict):
                 return jsonify({"success": False, "error": "请求体不能为空"}), 400
             
             task = self.scheduler.add_task(
@@ -91,9 +94,11 @@ class WebAPI:
         @self.app.route('/api/tasks/batch', methods=['POST'])
         def add_tasks():
             """批量添加任务"""
-            data = request.get_json(force=True)
+            data = request.get_json(silent=True)
             if not data or 'tasks' not in data:
                 return jsonify({"success": False, "error": "需要 tasks 数组"}), 400
+            if not isinstance(data['tasks'], list) or len(data['tasks']) > 100:
+                return jsonify({"success": False, "error": "tasks 必须为列表且不超过100条"}), 400
             
             count = self.scheduler.add_tasks(data['tasks'])
             return jsonify({
@@ -116,6 +121,7 @@ class WebAPI:
         
         @self.app.route('/api/control/stop', methods=['POST'])
         def stop():
+            logger.warning("收到停止请求")
             self.scheduler.stop()
             return jsonify({"success": True, "message": "Agent 已停止"})
         
@@ -127,8 +133,13 @@ class WebAPI:
                 return jsonify({"success": False, "error": "知识图谱未启用"}), 503
             
             query = request.args.get('q', '')
+            if not query or not query.strip():
+                return jsonify({"success": False, "error": "搜索关键词不能为空"}), 400
             category = request.args.get('category')
-            limit = int(request.args.get('limit', 20))
+            try:
+                limit = max(1, min(int(request.args.get('limit', 20)), 100))
+            except (ValueError, TypeError):
+                limit = 20
             
             results = self.kg.search_nodes(query, category=category, limit=limit)
             return jsonify({
@@ -162,7 +173,11 @@ class WebAPI:
             if not self.kg:
                 return jsonify({"success": False, "error": "知识图谱未启用"}), 503
             
-            data = request.get_json(force=True)
+            data = request.get_json(silent=True)
+            if not data or not isinstance(data, dict):
+                return jsonify({"success": False, "error": "请求体不能为空"}), 400
+            if not data.get('title'):
+                return jsonify({"success": False, "error": "title 不能为空"}), 400
             node_id = self.kg.store_experience(
                 title=data.get('title', ''),
                 content=data.get('content', ''),
@@ -182,6 +197,8 @@ class WebAPI:
                 return jsonify({"success": False, "error": "知识图谱未启用"}), 503
             
             query = request.args.get('q', '')
+            if not query or not query.strip():
+                return jsonify({"success": False, "error": "搜索关键词不能为空"}), 400
             context = self.kg.get_relevant_context(query)
             return jsonify({"success": True, "data": {"context": context}})
         
@@ -192,7 +209,10 @@ class WebAPI:
             if not self.optimizer:
                 return jsonify({"success": False, "error": "优化器未启用"}), 503
             
-            limit = int(request.args.get('limit', 20))
+            try:
+                limit = max(1, min(int(request.args.get('limit', 20)), 100))
+            except (ValueError, TypeError):
+                limit = 20
             return jsonify({
                 "success": True,
                 "data": self.optimizer.get_optimization_history(limit)
@@ -252,7 +272,12 @@ class WebAPI:
                     "停止": "POST /api/control/stop"
                 }
             })
-    
+
+        @self.app.errorhandler(Exception)
+        def handle_exception(e):
+            logger.error(f"API 异常: {type(e).__name__}: {e}", exc_info=True)
+            return jsonify({"success": False, "error": "内部服务器错误"}), 500
+
     def run(self, host: str = "0.0.0.0", port: int = 8899, debug: bool = False):
         """启动 Web 服务"""
         logger.info(f"🌐 Web API 启动: http://{host}:{port}")

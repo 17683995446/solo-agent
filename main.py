@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import logging
+import sqlite3
 import threading
 import argparse
 
@@ -120,8 +121,10 @@ class SoloAgent:
         for k in initial_knowledge:
             try:
                 self.kg.store_experience(**k)
+            except sqlite3.IntegrityError:
+                logger.debug(f"初始知识已存在，跳过: {k.get('title', '?')}")
             except Exception as e:
-                logger.debug(f"初始知识注入跳过(可能已存在): {e}")
+                logger.warning(f"初始知识注入失败: {k.get('title', '?')}: {e}")
     
     def run(self, with_api: bool = True, load_examples: bool = True):
         """启动 Agent"""
@@ -149,10 +152,11 @@ class SoloAgent:
             )
         
         # 启动主循环（阻塞）
-        self.scheduler.start()
-        
-        # 主循环结束后清理资源
-        self.kg.close()
+        try:
+            self.scheduler.start()
+        finally:
+            self.kg.close()
+            logger.info("Agent 已停止，资源已清理")
     
     def run_cli(self):
         """命令行交互模式"""
@@ -162,11 +166,11 @@ class SoloAgent:
         print("=" * 60 + "\n")
         
         # 在后台线程启动调度器
-        scheduler_thread = threading.Thread(target=self.scheduler.start, daemon=True)
-        scheduler_thread.start()
+        self._scheduler_thread = threading.Thread(target=self.scheduler.start, daemon=True)
+        self._scheduler_thread.start()
         
         # 同时启动 API
-        api_thread = threading.Thread(
+        self._api_thread = threading.Thread(
             target=self.webapi.run,
             kwargs={
                 "host": self.config.webapi.host,
@@ -174,7 +178,7 @@ class SoloAgent:
             },
             daemon=True
         )
-        api_thread.start()
+        self._api_thread.start()
         
         time.sleep(1)  # 等待启动
         
@@ -237,6 +241,12 @@ class SoloAgent:
                 break
             except Exception as e:
                 print(f"错误: {e}")
+        
+        # 等待后台线程结束
+        self._scheduler_thread.join(timeout=3)
+        self._api_thread.join(timeout=3)
+        self.kg.close()
+        logger.info("Agent 已停止，资源已清理")
     
     def _print_help(self):
         help_text = """
@@ -343,7 +353,7 @@ def main():
     parser.add_argument('--mode', '-m', choices=['cli', 'daemon', 'api'], 
                        default='cli', help='运行模式 (默认: cli)')
     parser.add_argument('--no-examples', action='store_true', help='不加载示例任务')
-    parser.add_argument('--port', '-p', type=int, default=8899, help='API 端口')
+    parser.add_argument('--port', '-p', type=int, default=None, help='API 端口')
     parser.add_argument('--api-key', default='', help='LLM API Key')
     
     args = parser.parse_args()
@@ -354,7 +364,7 @@ def main():
     # 命令行覆盖配置
     if args.api_key:
         agent.config.llm.api_key = args.api_key
-    if args.port:
+    if args.port is not None:
         agent.config.webapi.port = args.port
     
     # 根据模式启动
