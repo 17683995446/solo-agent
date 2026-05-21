@@ -48,8 +48,8 @@ class KeepAliveScheduler:
         self._completed_lock = threading.Lock()  # 保护已完成任务列表
         
         # 运行状态
-        self._running = False
-        self._paused = False
+        self._running = threading.Event()
+        self._paused = threading.Event()
         self._cycle_count = 0
         self._start_time = None
         self._last_optimize_cycle = 0
@@ -69,8 +69,11 @@ class KeepAliveScheduler:
         self._stats_lock = threading.Lock()
         
         # 注册信号处理
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except ValueError:
+            logger.warning("信号处理器注册失败（非主线程），请通过stop()方法优雅关闭")
     
     def _signal_handler(self, signum, frame):
         """优雅关闭"""
@@ -134,19 +137,21 @@ class KeepAliveScheduler:
     
     def start(self):
         """启动 Agent - 开始永不停歇的运转"""
-        if self._running:
+        if self._running.is_set():
             logger.warning("Agent 已在运行中")
             return
         
-        self._running = True
-        self._paused = False
+        self._running.set()
+        self._paused.clear()
         self._start_time = time.time()
         
         logger.info("=" * 60)
         logger.info("🚀 极简全能持续运行 Agent 启动!")
         logger.info(f"   名称: {self.config.name}")
         logger.info(f"   版本: {self.config.version}")
-        logger.info(f"   任务队列: {len(self._task_queue)} 个任务")
+        with self._lock:
+            queue_size = len(self._task_queue)
+        logger.info(f"   任务队列: {queue_size} 个任务")
         logger.info("=" * 60)
         
         try:
@@ -157,21 +162,22 @@ class KeepAliveScheduler:
     
     def stop(self):
         """停止 Agent - 确保所有子线程也停止"""
-        self._running = False
-        self._paused = False
+        self._running.clear()
+        self._paused.clear()
         if self._start_time:
-            self._stats["uptime_seconds"] = time.time() - self._start_time
+            with self._stats_lock:
+                self._stats["uptime_seconds"] = time.time() - self._start_time
         # 等待一小段时间让当前执行中的任务完成
         logger.info("🛑 Agent 已停止")
     
     def pause(self):
         """暂停"""
-        self._paused = True
+        self._paused.set()
         logger.info("⏸ Agent 已暂停")
     
     def resume(self):
         """恢复"""
-        self._paused = False
+        self._paused.clear()
         logger.info("▶ Agent 已恢复运行")
     
     def _main_loop(self):
@@ -179,14 +185,14 @@ class KeepAliveScheduler:
         主循环 - Agent 的心跳
         修复：执行线紧密循环，优化线异步执行
         """
-        while self._running:
+        while self._running.is_set():
             cycle_start = time.time()
             self._cycle_count += 1
             with self._stats_lock:
                 self._stats["total_cycles"] += 1
             
             try:
-                if self._paused:
+                if self._paused.is_set():
                     logger.debug("暂停中，等待恢复...")
                     time.sleep(1)
                     continue
@@ -225,7 +231,7 @@ class KeepAliveScheduler:
                 task,
                 max_retries=self.config.scheduler.retry_max,
                 retry_delay=self.config.scheduler.retry_delay,
-                should_stop=lambda: not self._running  # 传入停止信号
+                should_stop=lambda: not self._running.is_set()  # 传入停止信号
             )
             
             # 记录结果
@@ -270,7 +276,7 @@ class KeepAliveScheduler:
         """知识线 - 确保知识图谱持续更新"""
         # 知识积累在执行线和优化线中已经自动进行
         # 这里做周期性的知识整理
-        if self._cycle_count % 50 == 0 and self.kg:
+        if self._cycle_count % 50 == 0 and self._cycle_count > 0 and self.kg:
             try:
                 stats = self.kg.get_stats()
                 logger.debug(
@@ -330,7 +336,7 @@ class KeepAliveScheduler:
             time.sleep(3)
 
             # Bug修复: 恢复前检查是否已被外部停止（例如 stop() 已被调用）
-            if not self._running:
+            if not self._running.is_set():
                 logger.info("  自动恢复取消: Agent 已被外部停止")
                 return
 
@@ -341,14 +347,14 @@ class KeepAliveScheduler:
                     # 知识图谱已有持久化，无需重新初始化
 
                 logger.info("  恢复完成，重新启动主循环...")
-                self._running = True
+                self._running.set()
                 self._main_loop()
                 # _main_loop 正常返回（_running 被设为 False），退出恢复循环
                 return
             except Exception as e2:
                 logger.critical(f"自动恢复失败: {e2}")
                 # Bug修复: 循环重试而非递归，检查是否应继续恢复
-                if not self._running:
+                if not self._running.is_set():
                     logger.info("  自动恢复终止: Agent 已被外部停止")
                     return
                 # 继续循环，下一次迭代将再次尝试恢复
@@ -356,7 +362,8 @@ class KeepAliveScheduler:
     def _shutdown(self):
         """优雅关闭 - 不关闭共享的知识图谱（由创建者管理生命周期）"""
         logger.info("正在执行优雅关闭...")
-        self._stats["uptime_seconds"] = time.time() - self._start_time if self._start_time else 0
+        with self._stats_lock:
+            self._stats["uptime_seconds"] = time.time() - self._start_time if self._start_time else 0
         
         # 保存最终统计
         if self.kg:
@@ -391,8 +398,8 @@ class KeepAliveScheduler:
         with self._completed_lock:
             completed_count = len(self._completed_tasks)
         return {
-            "running": self._running,
-            "paused": self._paused,
+            "running": self._running.is_set(),
+            "paused": self._paused.is_set(),
             "name": self.config.name,
             "version": self.config.version,
             "cycle_count": self._cycle_count,
@@ -406,6 +413,7 @@ class KeepAliveScheduler:
     
     def get_recent_tasks(self, limit: int = 20) -> List[Dict]:
         """获取最近完成的任务"""
+        limit = max(1, min(limit, 1000))
         with self._completed_lock:
             return list(self._completed_tasks[-limit:])
     

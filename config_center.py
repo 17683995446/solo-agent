@@ -8,6 +8,7 @@ import os
 import json
 import time
 import logging
+import tempfile
 import threading
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, field, asdict
@@ -179,6 +180,10 @@ class ConfigCenter:
                 if old_value != value:
                     self._notify_change(key, old_value, value, "file")
     
+    def _flatten_config(self) -> Dict[str, Any]:
+        """扁平化当前配置"""
+        return self._flatten(self._config)
+
     def _flatten(self, config: Dict, parent_key: str = "") -> Dict[str, Any]:
         """将嵌套配置扁平化"""
         items = []
@@ -218,10 +223,12 @@ class ConfigCenter:
                 self._set_nested(self._config, key, schema.default)
     
     def get(self, key: str, default: Any = None) -> Any:
-        """获取配置值"""
+        """获取配置值，通过检查 key 是否存在来区分 None 值和缺失 key"""
         with self._lock:
-            value = self._get_nested(self._config, key)
-            return value if value is not None else default
+            flat = self._flatten_config()
+            if key in flat:
+                return flat[key]
+            return default
     
     def set(self, key: str, value: Any, source: str = "api") -> bool:
         """
@@ -305,9 +312,10 @@ class ConfigCenter:
             def __init__(self, config_center):
                 self.config_center = config_center
                 self.last_reload = 0
-            
+                self._config_path = os.path.abspath(config_center.config_path)
+
             def on_modified(self, event):
-                if event.src_path == self.config_center.config_path:
+                if os.path.abspath(event.src_path) == self._config_path:
                     # 防抖：避免重复加载
                     now = time.time()
                     if now - self.last_reload < 1.0:
@@ -335,22 +343,32 @@ class ConfigCenter:
             logger.info("配置热更新监听已停止")
     
     def save(self) -> bool:
-        """保存配置到文件"""
+        """保存配置到文件（原子写入）"""
         try:
             with self._lock:
                 config_copy = dict(self._config)
-            
-            with open(self.config_path, 'w', encoding='utf-8') as f:
+
+            # 先写入临时文件，再原子替换，保证写入原子性
+            tmp_path = self.config_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
                     import yaml
                     yaml.dump(config_copy, f, allow_unicode=True, default_flow_style=False)
                 else:
                     json.dump(config_copy, f, ensure_ascii=False, indent=2)
-            
+            os.replace(tmp_path, self.config_path)
+
             logger.info(f"配置已保存: {self.config_path}")
             return True
         except Exception as e:
             logger.error(f"配置保存失败: {e}")
+            # 清理可能残留的临时文件
+            tmp_path = self.config_path + '.tmp'
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             return False
     
     def get_all(self) -> Dict:

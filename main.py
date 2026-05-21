@@ -136,7 +136,7 @@ class SoloAgent:
         
         if with_api:
             # API 在独立线程运行
-            api_thread = threading.Thread(
+            self._api_thread = threading.Thread(
                 target=self.webapi.run,
                 kwargs={
                     "host": self.config.webapi.host,
@@ -145,7 +145,7 @@ class SoloAgent:
                 },
                 daemon=True
             )
-            api_thread.start()
+            self._api_thread.start()
             logger.info(
                 f"Web API 已在后台启动: "
                 f"http://{self.config.webapi.host}:{self.config.webapi.port}"
@@ -155,6 +155,7 @@ class SoloAgent:
         try:
             self.scheduler.start()
         finally:
+            self.scheduler.stop()
             self.kg.close()
             logger.info("Agent 已停止，资源已清理")
     
@@ -371,8 +372,10 @@ def main():
     if args.mode == 'cli':
         agent.run_cli()
     elif args.mode == 'daemon':
+        # daemon 模式：后台运行 Agent 主循环 + Web API，行为与 api 模式一致
         agent.run(with_api=True, load_examples=not args.no_examples)
     elif args.mode == 'api':
+        # api 模式：后台运行 Agent 主循环 + Web API，行为与 daemon 模式一致
         agent.run(with_api=True, load_examples=not args.no_examples)
 
 

@@ -8,13 +8,14 @@ import os
 import json
 import sqlite3
 import time
+import uuid
 import logging
 import threading
 import networkx as nx
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from pathlib import Path
 
 logger = logging.getLogger("agent.knowledge")
 
@@ -37,7 +38,7 @@ class KnowledgeNode:
     
     def __post_init__(self):
         if not self.id:
-            self.id = f"n_{int(time.time()*1000)}_{hash(self.title) % 10000}"
+            self.id = f"n_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}_{hash(self.title) % 10000}"
         if not self.created_at:
             self.created_at = datetime.now().isoformat()
         if not self.updated_at:
@@ -72,6 +73,8 @@ class KnowledgeGraph:
     """
     
     def __init__(self, db_path: str = "data/knowledge.db"):
+        if not db_path:
+            db_path = "data/knowledge.db"
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
         self._graph = nx.DiGraph()
@@ -250,7 +253,6 @@ class KnowledgeGraph:
             );
             
             CREATE INDEX IF NOT EXISTS idx_nodes_category ON nodes(category);
-            CREATE INDEX IF NOT EXISTS idx_nodes_tags ON nodes(tags);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
             CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
@@ -375,14 +377,15 @@ class KnowledgeGraph:
             conn.commit()
             # 更新版本号
             self._last_sync_version = self._get_db_version()
-            self._graph.remove_node(node_id)
+            if node_id in self._graph:
+                self._graph.remove_node(node_id)
             logger.debug(f"删除节点: {node_id}")
             return True
     
     # ---- 边操作 ----
     
     def add_edge(self, edge: KnowledgeEdge) -> bool:
-        """添加关系边（线程安全）"""
+        """添加关系边（线程安全），冲突时保留原始created_at"""
         with self._lock:
             if edge.source not in self._graph or edge.target not in self._graph:
                 logger.warning(f"边引用了不存在的节点: {edge.source} -> {edge.target}")
@@ -390,19 +393,29 @@ class KnowledgeGraph:
             
             conn = self._get_conn()
             try:
+                # 检查边是否已存在（用于决定created_at）
+                is_update = self._graph.has_edge(edge.source, edge.target)
+                existing_created_at = None
+                if is_update:
+                    existing_created_at = self._graph.edges[edge.source, edge.target].get('created_at', edge.created_at)
+
                 conn.execute(
-                    """INSERT OR REPLACE INTO edges (source, target, relation, weight, metadata, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO edges (source, target, relation, weight, metadata, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(source, target, relation) DO UPDATE SET weight=excluded.weight, metadata=excluded.metadata""",
                     (edge.source, edge.target, edge.relation, edge.weight,
                      json.dumps(edge.metadata, ensure_ascii=False), edge.created_at)
                 )
                 conn.commit()
                 # 更新版本号
                 self._last_sync_version = self._get_db_version()
+
+                # 更新内存图：冲突时保留原始created_at
+                actual_created_at = existing_created_at if is_update else edge.created_at
                 self._graph.add_edge(
                     edge.source, edge.target,
                     relation=edge.relation, weight=edge.weight,
-                    metadata=edge.metadata, created_at=edge.created_at
+                    metadata=edge.metadata, created_at=actual_created_at
                 )
                 logger.debug(f"添加边: {edge.source} -[{edge.relation}]-> {edge.target}")
                 return True
@@ -447,9 +460,9 @@ class KnowledgeGraph:
             
             # BFS 获取子图
             subgraph_nodes = set()
-            queue = [(node_id, 0)]
+            queue = deque([(node_id, 0)])
             while queue:
-                current, depth = queue.pop(0)
+                current, depth = queue.popleft()
                 if depth > max_depth:
                     continue
                 subgraph_nodes.add(current)
@@ -504,7 +517,7 @@ class KnowledgeGraph:
             conn = self._get_conn()
 
             # 直接写入 SQLite（与 add_node 内部逻辑一致）
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT OR IGNORE INTO nodes
                    (id, title, content, category, tags, metadata, created_at, updated_at, importance)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -514,8 +527,21 @@ class KnowledgeGraph:
                  node.created_at, node.updated_at, node.importance)
             )
 
-            # 直接写入 NetworkX（与 add_node 内部逻辑一致）
-            self._graph.add_node(node.id, **asdict(node))
+            # 与 add_node 保持一致：检查是否实际插入了新行
+            if cursor.rowcount > 0:
+                self._graph.add_node(node.id, **asdict(node))
+            else:
+                # 节点已存在，从数据库同步最新数据到内存图
+                row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone()
+                if row:
+                    existing = KnowledgeNode(
+                        id=row['id'], title=row['title'], content=row['content'],
+                        category=row['category'], tags=json.loads(row['tags']),
+                        metadata=json.loads(row['metadata']),
+                        created_at=row['created_at'], updated_at=row['updated_at'],
+                        importance=row['importance']
+                    )
+                    self._graph.add_node(existing.id, **asdict(existing))
 
             # 建立关联边（直接操作，不调用 add_edge）
             if related_to:

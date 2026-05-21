@@ -22,6 +22,7 @@ class WebAPI:
         self.executor = executor
         self.optimizer = optimizer
         self.app = Flask(__name__)
+        self.app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 限制请求体最大 1MB
         self._register_routes()
         logger.info("Web API 路由注册完成")
     
@@ -76,13 +77,29 @@ class WebAPI:
             data = request.get_json(silent=True)
             if not data or not isinstance(data, dict):
                 return jsonify({"success": False, "error": "请求体不能为空"}), 400
-            
+
+            # task_type 白名单验证
+            allowed_types = {'echo', 'compute', 'llm_task', 'file_write', 'file_read', 'research', 'summarize', 'health_check', 'knowledge_query', 'self_improve', 'pipeline', 'general'}
+            task_type = data.get('task_type', 'general')
+            if task_type not in allowed_types:
+                return jsonify({"error": f"不支持的任务类型: {task_type}"}), 400
+
+            # name/description 长度限制
+            name = str(data.get('name', ''))[:200]
+            description = str(data.get('description', ''))[:2000]
+
+            # priority 范围验证
+            try:
+                priority = max(-100, min(int(data.get('priority', 0)), 100))
+            except (ValueError, TypeError):
+                priority = 0
+
             task = self.scheduler.add_task(
-                name=data.get('name', '未命名任务'),
-                description=data.get('description', ''),
-                task_type=data.get('task_type', 'general'),
+                name=name,
+                description=description,
+                task_type=task_type,
                 params=data.get('params', {}),
-                priority=data.get('priority', 0)
+                priority=priority
             )
             
             return jsonify({
@@ -278,7 +295,8 @@ class WebAPI:
             logger.error(f"API 异常: {type(e).__name__}: {e}", exc_info=True)
             return jsonify({"success": False, "error": "内部服务器错误"}), 500
 
-    def run(self, host: str = "0.0.0.0", port: int = 8899, debug: bool = False):
+    def run(self, host: str = "127.0.0.1", port: int = 8899, debug: bool = False, bind_address: str = None):
         """启动 Web 服务"""
-        logger.info(f"🌐 Web API 启动: http://{host}:{port}")
-        self.app.run(host=host, port=port, debug=debug, threaded=True)
+        actual_host = bind_address if bind_address is not None else host
+        logger.info(f"Web API 启动: http://{actual_host}:{port}")
+        self.app.run(host=actual_host, port=port, debug=debug, threaded=True)

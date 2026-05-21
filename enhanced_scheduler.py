@@ -309,6 +309,7 @@ class EnhancedScheduler:
                 if task_id in self._tasks:
                     task = self._tasks[task_id]
                     if task.state == TaskState.READY:
+                        task.state = TaskState.RUNNING
                         return task
             
             return None
@@ -386,10 +387,6 @@ class EnhancedScheduler:
         if cancelled_count > 0:
             logger.info(f"失败传播: {failed_task.name} → {cancelled_count} 个下游任务被取消")
 
-    def _execute_task_locked(self, task: Task):
-        """在锁内启动任务执行（仅注册线程，不等待）"""
-        self._execute_task(task)
-
     def _execute_task(self, task: Task):
         """执行任务（非阻塞，立即返回）"""
         task.state = TaskState.RUNNING
@@ -449,6 +446,8 @@ class EnhancedScheduler:
                         task.error = f"任务超时 ({timeout}s)"
                         self._stats["total_timeout"] += 1
                         logger.warning(f"⏱ 任务 {task.name} 超时 ({timeout}s)")
+                        if task.id in self._running_tasks:
+                            del self._running_tasks[task.id]
                         self._propagate_failure(task)
 
         watcher = threading.Thread(target=timeout_watcher, name=f"Timeout-{task.name}", daemon=True)
@@ -475,14 +474,15 @@ class EnhancedScheduler:
 
             # ★ Bug修复：在锁内检查并发数并启动任务，避免竞态
             with self._lock:
-                if len(self._running_tasks) < max_concurrent:
+                launched = False
+                while len(self._running_tasks) < max_concurrent:
                     task = self._get_next_task()
                     if task:
-                        self._execute_task_locked(task)
+                        self._execute_task(task)
+                        launched = True
                     else:
-                        # 没有就绪任务，释放锁后等待
-                        pass
-                else:
+                        break
+                if not launched:
                     task = None
 
             if task is None:
@@ -513,15 +513,20 @@ class EnhancedScheduler:
         self._shutdown_event.set()
 
         if wait:
-            # ★ Bug修复：等待所有非终态任务完成或就绪队列清空
+            # ★ Bug修复：等待所有运行中任务完成，超时后强制清理
             start = time.time()
             while time.time() - start < timeout:
                 with self._lock:
                     running = len(self._running_tasks)
-                    ready = len(self._ready_queue)
-                    if running == 0 and ready == 0:
+                    if running == 0:
+                        # 清空就绪队列（停止后不再需要）
+                        self._ready_queue.clear()
                         break
                 time.sleep(0.1)
+            else:
+                # 超时后强制清理
+                with self._lock:
+                    self._ready_queue.clear()
     
     def pause(self):
         """暂停调度"""
@@ -553,6 +558,10 @@ class EnhancedScheduler:
                 entry for entry in self._ready_queue
                 if entry[2] != task_id  # entry = (-priority, created_at, task_id)
             ]
+            heapq.heapify(self._ready_queue)
+
+            # 传播取消到下游依赖任务
+            self._propagate_failure(task)
 
             return True
     

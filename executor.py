@@ -10,7 +10,6 @@ import uuid
 import logging
 import traceback
 import os
-import re
 import threading
 from typing import Optional, Callable, Dict, Any, List
 from dataclasses import dataclass, field
@@ -205,6 +204,7 @@ class TaskExecutor:
             # 安全错误 - 记录但不重试
             task.error = f"安全错误: {str(e)}"
             task.status = TaskStatus.FAILED.value
+            task.metadata['no_retry'] = True
             with self._stats_lock:
                 self._stats["total_failed"] += 1
                 self._stats["security_blocked"] += 1
@@ -214,6 +214,7 @@ class TaskExecutor:
             # 任务执行错误 - 不应重试的错误
             task.error = str(e)
             task.status = TaskStatus.FAILED.value
+            task.metadata['no_retry'] = True
             with self._stats_lock:
                 self._stats["total_failed"] += 1
             logger.error(f"  ✗ {task.error}")
@@ -230,8 +231,8 @@ class TaskExecutor:
             with self._stats_lock:
                 self._stats["total_executed"] += 1
             
-            # 将结果存入知识图谱
-            if self.kg:
+            # 将结果存入知识图谱（重试期间跳过，由 execute_with_retry 在最终结果确定后统一存储）
+            if self.kg and not task.metadata.get('_in_retry'):
                 try:
                     self.kg.store_task_result(
                         task_name=task.name,
@@ -252,60 +253,80 @@ class TaskExecutor:
                            retry_delay: float = 2.0, 
                            should_stop: Optional[Callable[[], bool]] = None) -> Task:
         """带重试的执行 - 智能重试策略，支持外部停止信号"""
-        for attempt in range(max_retries + 1):
-            # 检查外部停止信号
-            if should_stop and should_stop():
-                task.error = "任务被取消（系统停止）"
-                task.status = TaskStatus.FAILED.value
-                logger.info(f"  ⊘ 任务 [{task.id}] 被取消")
-                return task
-            
-            if attempt > 0:
-                task.retry_count = attempt
-                task.status = TaskStatus.RETRYING.value
-                with self._stats_lock:
-                    self._stats["total_retries"] += 1
-                logger.info(f"  ↻ 重试任务 [{task.id}] 第 {attempt} 次 (共 {max_retries} 次)")
-                # Bug修复: 将 time.sleep 改为分段 sleep，每段检查 should_stop，确保重试等待期间能响应停止信号
-                total_wait = retry_delay * attempt
-                elapsed = 0.0
-                step = 0.5  # 每 0.5 秒检查一次停止信号
-                while elapsed < total_wait:
-                    if should_stop and should_stop():
-                        task.error = "任务被取消（系统停止）"
-                        task.status = TaskStatus.FAILED.value
-                        logger.info(f"  ⊘ 任务 [{task.id}] 在重试等待中被取消")
-                        return task
-                    sleep_time = min(step, total_wait - elapsed)
-                    time.sleep(sleep_time)
-                    elapsed += sleep_time
-            
-            self.execute(task)
-            
-            if task.status == TaskStatus.SUCCESS.value:
-                return task
-            
-            # 检查是否应该重试
-            # 安全错误和任务执行错误不重试
-            if "安全错误" in task.error or "未找到任务类型" in task.error:
-                logger.info(f"  ⊘ 跳过重试: {task.error}")
-                break
-            
-            # LLM认证错误不重试（401等）- 检查error和LLM错误计数
-            if "401" in task.error or "Unauthorized" in task.error or "认证" in task.error:
-                logger.info(f"  ⊘ 跳过重试: LLM认证错误")
-                break
-            
-            # LLM连续失败不重试（API不可用时重试无意义）
-            if self.llm and self.llm.get_stats().get("error_count", 0) > 0:
-                if "LLM 返回空结果" in task.error or "LLM" in task.error:
-                    error_count = self.llm.get_stats().get("error_count", 0)
-                    logger.info(f"  ⊘ 跳过重试: LLM服务不可用 (连续{error_count}次错误)")
+        # 标记任务处于重试流程中，execute 的 finally 块将跳过知识图谱存储
+        task.metadata['_in_retry'] = True
+
+        try:
+            for attempt in range(max_retries + 1):
+                # 检查外部停止信号
+                if should_stop and should_stop():
+                    task.error = "任务被取消（系统停止）"
+                    task.status = TaskStatus.FAILED.value
+                    logger.info(f"  ⊘ 任务 [{task.id}] 被取消")
+                    return task
+                
+                if attempt > 0:
+                    task.retry_count = attempt
+                    task.status = TaskStatus.RETRYING.value
+                    with self._stats_lock:
+                        self._stats["total_retries"] += 1
+                    logger.info(f"  ↻ 重试任务 [{task.id}] 第 {attempt} 次 (共 {max_retries} 次)")
+                    # Bug修复: 将 time.sleep 改为分段 sleep，每段检查 should_stop，确保重试等待期间能响应停止信号
+                    total_wait = retry_delay * attempt
+                    elapsed = 0.0
+                    step = 0.5  # 每 0.5 秒检查一次停止信号
+                    while elapsed < total_wait:
+                        if should_stop and should_stop():
+                            task.error = "任务被取消（系统停止）"
+                            task.status = TaskStatus.FAILED.value
+                            logger.info(f"  ⊘ 任务 [{task.id}] 在重试等待中被取消")
+                            return task
+                        sleep_time = min(step, total_wait - elapsed)
+                        time.sleep(sleep_time)
+                        elapsed += sleep_time
+                
+                self.execute(task)
+                
+                if task.status == TaskStatus.SUCCESS.value:
+                    return task
+                
+                # 检查是否应该重试 - 使用 no_retry 标志而非字符串匹配
+                if task.metadata.get('no_retry'):
+                    logger.info(f"  ⊘ 跳过重试: {task.error}")
                     break
+                
+                # LLM认证错误不重试（401等）
+                if "401" in task.error or "Unauthorized" in task.error or "认证" in task.error:
+                    logger.info(f"  ⊘ 跳过重试: LLM认证错误")
+                    break
+                
+                # LLM连续失败不重试（API不可用时重试无意义）
+                # 使用 consecutive_errors 而非 error_count，避免因历史错误导致永远跳过重试
+                if self.llm and self.llm.get_stats().get("consecutive_errors", 0) > 3:
+                    if "LLM 返回空结果" in task.error or "LLM" in task.error:
+                        consecutive_errors = self.llm.get_stats().get("consecutive_errors", 0)
+                        logger.info(f"  ⊘ 跳过重试: LLM服务不可用 (连续{consecutive_errors}次错误)")
+                        break
+            
+            if task.status != TaskStatus.SUCCESS.value:
+                logger.error(f"  ✗ 任务 [{task.id}] 执行失败")
+            return task
         
-        if task.status != TaskStatus.SUCCESS.value:
-            logger.error(f"  ✗ 任务 [{task.id}] 执行失败")
-        return task
+        finally:
+            # 清除重试标记
+            task.metadata.pop('_in_retry', None)
+            # 重试流程结束后，统一存储一次知识图谱结果
+            if self.kg:
+                try:
+                    self.kg.store_task_result(
+                        task_name=task.name,
+                        result=task.result[:500] if task.result else "",
+                        success=(task.status == TaskStatus.SUCCESS.value),
+                        error=task.error,
+                        method=task.method
+                    )
+                except Exception as e:
+                    logger.warning(f"  存储任务结果到知识图谱失败: {e}")
     
     # ---- 内置任务处理器 ----
     
@@ -320,28 +341,44 @@ class TaskExecutor:
     def _handle_compute(self, task: Task, context: str) -> str:
         """
         计算任务 - 安全执行数学表达式
-        修复：正确处理计算错误
+        安全策略（双重防护）：
+        1. 字符白名单：只允许数字、运算符、括号、空格、字母（用于函数名）
+        2. 受限命名空间：__builtins__={} 禁止访问内置模块，
+           只暴露 abs/round/min/max/pow/sum 等安全数学函数
+        3. 危险模式检查：禁止 __、方括号[]（防止属性访问和下标越界）
         """
         # ★ Bug修复：兼容 expr 和 expression 两种参数名
         expr = task.params.get("expr") or task.params.get("expression") or task.description
-        
-        # 安全检查：只允许数学字符
-        allowed = set("0123456789+-*/.() %^")
-        if not all(c in allowed for c in str(expr)):
-            raise SecurityError("不安全的表达式")
-        
-        # 额外检查：禁止危险模式
-        dangerous_patterns = ['__', 'import', 'exec', 'eval', 'open', 'os', 'sys']
+
+        # 安全检查第一层：字符白名单
+        # 允许：数字、运算符、括号、空格、字母（用于函数名如abs/max）
+        # 禁止：__（双下划线，属性访问）、[](方括号，下标/切片）、;（语句分隔）
+        allowed = set("0123456789+-*/.() %^,abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        expr_str = str(expr)
+        if not all(c in allowed for c in expr_str):
+            raise SecurityError("不安全的表达式: 包含非法字符")
+
+        # 安全检查第二层：危险模式
+        dangerous_patterns = ['__', '[', ']', ';', ':', '{', '}', '\\', '"', "'"]
         for pattern in dangerous_patterns:
-            if pattern in str(expr).lower():
+            if pattern in expr_str:
                 raise SecurityError(f"禁止的表达式模式: {pattern}")
-        
+
         try:
             # 将 ^ 替换为 ** (幂运算)
-            expr = str(expr).replace('^', '**')
-            # 使用受限的eval
-            result = eval(expr, {"__builtins__": {}}, {})
-            return f"计算结果: {expr} = {result}"
+            safe_expr = expr_str.replace('^', '**')
+            # 使用受限命名空间提供安全的数学函数，禁止访问任何内置模块
+            safe_namespace = {
+                "__builtins__": {},
+                "abs": abs,
+                "round": round,
+                "min": min,
+                "max": max,
+                "pow": pow,
+                "sum": sum,
+            }
+            result = eval(safe_expr, safe_namespace, {})
+            return f"计算结果: {safe_expr} = {result}"
         except ZeroDivisionError:
             raise TaskExecutionError("计算错误: 除零")
         except OverflowError:
@@ -411,8 +448,8 @@ class TaskExecutor:
                 raise TaskExecutionError(f"文件过大: {filepath}")
             
             with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-            return content[:2000]
+                content = f.read(2000)
+            return content
         except FileNotFoundError:
             raise TaskExecutionError(f"文件不存在: {filepath}")
         except PermissionError:
@@ -463,15 +500,18 @@ class TaskExecutor:
         # Bug修复: 使用 time.time() - self._start_time 计算真实运行时间，而非直接使用 time.time()
         uptime = time.time() - self._start_time
 
+        # Bug修复: 通过 get_stats() 获取线程安全的统计信息，而非直接访问 self._stats
+        stats = self.get_stats()
+
         checks = {
             "系统运行时间": f"{uptime:.0f}s",
             "Python版本": sys.version.split()[0],
             "工作目录": os.getcwd(),
             "知识图谱": f"{'正常' if self.kg else '未配置'}",
             "LLM": f"{'正常' if self.llm else '未配置'}",
-            "已执行任务": str(self._stats["total_executed"]),
-            "成功率": f"{self._stats['total_success'] / max(1, self._stats['total_executed']) * 100:.1f}%",
-            "安全拦截": str(self._stats["security_blocked"])
+            "已执行任务": str(stats["total_executed"]),
+            "成功率": f"{stats['total_success'] / max(1, stats['total_executed']) * 100:.1f}%",
+            "安全拦截": str(stats["security_blocked"])
         }
         
         if self.kg:
@@ -575,6 +615,7 @@ class TaskExecutor:
             
             step_task = Task(
                 name=f"{task.name}_step{i}",
+                description=step.get("description", f"pipeline step {i}: {step_type}"),
                 task_type=step_type,
                 params=step_params or {}
             )
