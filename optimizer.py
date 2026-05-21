@@ -99,6 +99,12 @@ class Optimizer:
                 # 批量分析（在锁外执行LLM调用）
                 if should_batch:
                     batch_result = self._batch_analyze_successes(batch_data)
+                    # Bug修复 #24: 批量分析失败时恢复数据到_pending_successes
+                    if batch_result is None:
+                        with self._lock:
+                            # 将数据恢复到队列头部，避免数据丢失
+                            self._pending_successes = batch_data + self._pending_successes
+                            logger.debug(f"批量分析失败，已恢复 {len(batch_data)} 条数据到待处理队列")
                     return batch_result
 
         return None

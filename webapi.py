@@ -17,6 +17,10 @@ class WebAPI:
     """
     
     def __init__(self, scheduler, knowledge_graph=None, executor=None, optimizer=None):
+        # 参数验证：scheduler 不能为 None
+        if scheduler is None:
+            raise ValueError("scheduler 参数不能为 None，所有 API 路由都依赖它")
+        
         self.scheduler = scheduler
         self.kg = knowledge_graph
         self.executor = executor
@@ -32,10 +36,18 @@ class WebAPI:
         @self.app.route('/api/status', methods=['GET'])
         def get_status():
             """获取 Agent 状态"""
-            return jsonify({
-                "success": True,
-                "data": self.scheduler.get_status()
-            })
+            try:
+                status = self.scheduler.get_status()
+                return jsonify({
+                    "success": True,
+                    "data": status
+                })
+            except Exception as e:
+                logger.error(f"获取状态失败: {e}", exc_info=True)
+                return jsonify({
+                    "success": False,
+                    "error": f"获取状态失败: {str(e)}"
+                }), 500
         
         @self.app.route('/api/health', methods=['GET'])
         def health_check():
@@ -94,19 +106,26 @@ class WebAPI:
             except (ValueError, TypeError):
                 priority = 0
 
-            task = self.scheduler.add_task(
-                name=name,
-                description=description,
-                task_type=task_type,
-                params=data.get('params', {}),
-                priority=priority
-            )
-            
-            return jsonify({
-                "success": True,
-                "data": task.to_dict(),
-                "message": f"任务 '{task.name}' 已添加到队列"
-            })
+            try:
+                task = self.scheduler.add_task(
+                    name=name,
+                    description=description,
+                    task_type=task_type,
+                    params=data.get('params', {}),
+                    priority=priority
+                )
+                
+                return jsonify({
+                    "success": True,
+                    "data": task.to_dict(),
+                    "message": f"任务 '{task.name}' 已添加到队列"
+                })
+            except Exception as e:
+                logger.error(f"添加任务失败: {e}", exc_info=True)
+                return jsonify({
+                    "success": False,
+                    "error": f"添加任务失败: {str(e)}"
+                }), 500
         
         @self.app.route('/api/tasks/batch', methods=['POST'])
         def add_tasks():

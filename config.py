@@ -128,11 +128,17 @@ class ConfigManager:
                 setattr(self._config, key, data[key])
         for section in ['llm', 'knowledge', 'scheduler', 'webapi']:
             if section in data:
+                # 检查 data[section] 是否为字典
+                if not isinstance(data[section], dict):
+                    logger.warning(f"配置项 '{section}' 不是字典类型，跳过")
+                    continue
                 parent = getattr(self._config, section, None)
-                if parent:
-                    for k, v in data[section].items():
-                        if hasattr(parent, k):
-                            setattr(parent, k, v)
+                if parent is None:
+                    logger.warning(f"配置项 '{section}' 不存在，跳过")
+                    continue
+                for k, v in data[section].items():
+                    if hasattr(parent, k):
+                        setattr(parent, k, v)
     
     def save(self, path: Optional[str] = None):
         save_path = path or self.config_path

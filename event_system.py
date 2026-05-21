@@ -129,12 +129,22 @@ class EventBus:
         
         self._running = False
         
-        if self._processor_task:
-            self._processor_task.cancel()
+        # Bug修复 #4: 添加线程检查和 _loop 非空验证
+        # run_until_complete 必须在事件循环所在线程调用
+        if self._processor_task and self._loop:
             try:
-                self._loop.run_until_complete(self._processor_task)
-            except asyncio.CancelledError:
-                pass
+                # 检查是否在事件循环所在线程
+                current_loop = asyncio.get_running_loop()
+                if current_loop is self._loop:
+                    # 在事件循环线程中，直接取消任务
+                    self._processor_task.cancel()
+                else:
+                    # 不在事件循环线程中，使用 call_soon_threadsafe 安全取消
+                    self._loop.call_soon_threadsafe(self._processor_task.cancel)
+            except RuntimeError:
+                # 没有运行中的事件循环，使用 call_soon_threadsafe
+                if self._loop and self._loop.is_running():
+                    self._loop.call_soon_threadsafe(self._processor_task.cancel)
         
         logger.info("事件总线已停止")
     
@@ -243,6 +253,12 @@ class EventBus:
             with self._stats_lock:
                 self._stats["published"] += 1
             return True
+        except asyncio.QueueFull:
+            # Bug修复 #8: 显式处理队列满异常
+            logger.warning(f"事件队列已满，事件 {event.type.name} 被丢弃")
+            with self._stats_lock:
+                self._stats["dropped"] += 1
+            return False
         except Exception as e:
             logger.error(f"发布事件失败: {e}")
             with self._stats_lock:
@@ -251,7 +267,6 @@ class EventBus:
     
     def publish_sync(self, event: Event):
         """同步发布并等待处理完成（用于关键事件）"""
-        # ★ Bug修复：publish_sync 是直接同步调用，不需要检查 _running 状态
         # 直接调用同步处理器
         handlers = self._handlers.get(event.type, [])
         for handler in handlers:
@@ -263,6 +278,33 @@ class EventBus:
                 logger.error(f"同步处理器异常: {e}")
                 with self._stats_lock:
                     self._stats["errors"] += 1
+        
+        # Bug修复 #9: 处理异步处理器
+        async_handlers = self._async_handlers.get(event.type, [])
+        if async_handlers:
+            for handler in async_handlers:
+                try:
+                    # 检查是否已在事件循环中
+                    try:
+                        loop = asyncio.get_running_loop()
+                        # 已在事件循环中，使用 run_coroutine_threadsafe 或创建任务
+                        if self._loop and self._loop.is_running():
+                            # 使用 call_soon_threadsafe 安全调度
+                            future = asyncio.run_coroutine_threadsafe(handler(event), self._loop)
+                            future.result(timeout=5.0)  # 等待完成，最多5秒
+                        else:
+                            # 当前循环可用，创建任务
+                            asyncio.create_task(handler(event))
+                    except RuntimeError:
+                        # 不在事件循环中，创建新的
+                        asyncio.run(handler(event))
+                    
+                    with self._stats_lock:
+                        self._stats["handled"] += 1
+                except Exception as e:
+                    logger.error(f"异步处理器异常: {e}")
+                    with self._stats_lock:
+                        self._stats["errors"] += 1
     
     def get_stats(self) -> Dict:
         """获取事件统计"""

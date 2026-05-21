@@ -159,10 +159,20 @@ class PluginManager:
             return None
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
         
-        # 实例化插件类
-        plugin_class = getattr(module, info.entry_point)
+        # Bug修复 #6: 模块加载失败后清理sys.modules
+        try:
+            spec.loader.exec_module(module)
+            
+            # 实例化插件类
+            plugin_class = getattr(module, info.entry_point)
+        except Exception as e:
+            # 加载失败时清理sys.modules中已注册的模块
+            if spec.name in sys.modules:
+                del sys.modules[spec.name]
+            logger.error(f"插件 {info.name} 模块加载失败: {e}")
+            logger.debug(traceback.format_exc())
+            return None
         instance = plugin_class()
         
         if not instance.initialize():
@@ -191,6 +201,8 @@ class PluginManager:
         sys.modules[module_name] = module
         
         # 读取并执行文件内容（耗时操作，不在锁内执行）
+        # 安全警告：exec()执行外部代码存在风险，请确保插件来源可信
+        logger.warning(f"正在加载外部插件: {plugin_file}，请确保来源可信")
         with open(plugin_file, 'r', encoding='utf-8') as f:
             code = f.read()
         exec(compile(code, str(plugin_file), 'exec'), module.__dict__)
@@ -266,11 +278,12 @@ class PluginManager:
             # 使用实际存储的模块名（单文件插件是 plugin_{stem}，包插件是 plugin_{name}）
             module_name = self._module_names.get(name)
             if module_name and module_name in sys.modules:
-                del sys.modules[module_name]
+                sys.modules.pop(module_name, None)
             # 同时清理可能的变体
+            # Bug修复 #14: 使用pop替代del避免遍历删除时的竞态条件
             for key in list(sys.modules.keys()):
                 if key == module_name or (module_name and key.startswith(module_name + "_")):
-                    del sys.modules[key]
+                    sys.modules.pop(key, None)
             
             # 清理
             del self._plugins[name]
@@ -286,6 +299,31 @@ class PluginManager:
         if name not in self._plugins:
             return False
         
+        # Bug修复 #15: 卸载前保存插件路径信息，防止重新加载失败后插件丢失
+        plugin = self._plugins[name]
+        info = plugin.get_info()
+        saved_plugin_path = None
+        
+        # 尝试找到插件的原始路径
+        for plugin_path in self.discover_plugins():
+            plugin_path = Path(plugin_path) if not isinstance(plugin_path, Path) else plugin_path
+            if plugin_path.is_dir():
+                manifest_path = plugin_path / "plugin.json"
+                if manifest_path.exists():
+                    try:
+                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                            manifest = json.load(f)
+                        if manifest.get('name') == name:
+                            saved_plugin_path = plugin_path
+                            break
+                    except:
+                        pass
+            else:
+                # 单文件插件：检查模块名是否匹配
+                if f"plugin_{plugin_path.stem}" == self._module_names.get(name):
+                    saved_plugin_path = plugin_path
+                    break
+        
         # 找到插件路径
         # 简化实现：先卸载再重新发现加载
         self.unload_plugin(name)
@@ -294,6 +332,11 @@ class PluginManager:
             loaded_name = self.load_plugin(plugin_path)
             if loaded_name == name:
                 return True
+        
+        # Bug修复 #15: 重新加载失败时记录错误
+        logger.error(f"插件 {name} 热重载失败：卸载后无法重新加载")
+        if saved_plugin_path:
+            logger.error(f"插件原始路径: {saved_plugin_path}，请手动重新加载")
         
         return False
     
@@ -418,9 +461,14 @@ class DatabasePlugin(PluginInterface):
         if not query:
             return {"error": "缺少查询语句"}
         
-        # 路径验证：只允许 data/ 目录下
-        db_path = os.path.normpath(db_path)
-        if not db_path.startswith("data" + os.sep) and db_path != "data" and not db_path.startswith("data/"):
+        # Bug修复 #20: 路径验证绕过风险 - 使用abspath和更严格的验证
+        # 获取允许的基础目录的绝对路径
+        base_dir = os.path.abspath("data")
+        # 获取请求路径的绝对路径
+        db_path = os.path.abspath(db_path)
+        
+        # 验证路径必须在允许的目录内
+        if not db_path.startswith(base_dir + os.sep) and db_path != base_dir:
             return {"error": f"数据库路径不合法，只允许 data/ 目录下: {db_path}"}
         
         # SQL安全检查：只允许 SELECT 语句

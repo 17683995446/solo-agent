@@ -37,60 +37,97 @@ class SoloAgent:
     """
     
     def __init__(self, config_path: str = None):
-        # 1. 加载配置
-        self.config_mgr = ConfigManager(config_path)
-        self.config = self.config_mgr.config
+        # 初始化资源跟踪列表，用于失败时清理
+        self._initialized_resources = []
+        self.kg = None
+        self.llm = None
+        self.executor = None
+        self.optimizer = None
+        self.scheduler = None
+        self.webapi = None
         
-        # 2. 初始化日志
-        setup_logging(self.config.log_dir)
-        logger.info("初始化 SoloAgent...")
-        
-        # 3. 初始化知识图谱
-        self.kg = KnowledgeGraph(self.config.knowledge.db_path)
-        
-        # 4. 初始化 LLM 客户端
-        self.llm = LLMClient(
-            api_url=self.config.llm.api_url,
-            api_key=self.config.llm.api_key,
-            model=self.config.llm.model,
-            temperature=self.config.llm.temperature,
-            max_tokens=self.config.llm.max_tokens,
-            timeout=self.config.llm.timeout
-        )
-        
-        # 5. 初始化执行引擎
-        self.executor = TaskExecutor(
-            knowledge_graph=self.kg,
-            llm_client=self.llm,
-            config=self.config
-        )
-        
-        # 6. 初始化优化模块
-        self.optimizer = Optimizer(
-            knowledge_graph=self.kg,
-            llm_client=self.llm
-        )
-        
-        # 7. 初始化调度器
-        self.scheduler = KeepAliveScheduler(
-            config=self.config,
-            knowledge_graph=self.kg,
-            executor=self.executor,
-            optimizer=self.optimizer
-        )
-        
-        # 8. 初始化 Web API
-        self.webapi = WebAPI(
-            scheduler=self.scheduler,
-            knowledge_graph=self.kg,
-            executor=self.executor,
-            optimizer=self.optimizer
-        )
-        
-        # 9. 存储初始知识
-        self._seed_knowledge()
-        
-        logger.info("SoloAgent 初始化完成!")
+        try:
+            # 1. 加载配置
+            self.config_mgr = ConfigManager(config_path)
+            self.config = self.config_mgr.config
+            
+            # 2. 初始化日志
+            setup_logging(self.config.log_dir)
+            logger.info("初始化 SoloAgent...")
+            
+            # 3. 初始化知识图谱
+            self.kg = KnowledgeGraph(self.config.knowledge.db_path)
+            self._initialized_resources.append('kg')
+            
+            # 4. 初始化 LLM 客户端
+            self.llm = LLMClient(
+                api_url=self.config.llm.api_url,
+                api_key=self.config.llm.api_key,
+                model=self.config.llm.model,
+                temperature=self.config.llm.temperature,
+                max_tokens=self.config.llm.max_tokens,
+                timeout=self.config.llm.timeout
+            )
+            self._initialized_resources.append('llm')
+            
+            # 5. 初始化执行引擎
+            self.executor = TaskExecutor(
+                knowledge_graph=self.kg,
+                llm_client=self.llm,
+                config=self.config
+            )
+            self._initialized_resources.append('executor')
+            
+            # 6. 初始化优化模块
+            self.optimizer = Optimizer(
+                knowledge_graph=self.kg,
+                llm_client=self.llm
+            )
+            self._initialized_resources.append('optimizer')
+            
+            # 7. 初始化调度器
+            self.scheduler = KeepAliveScheduler(
+                config=self.config,
+                knowledge_graph=self.kg,
+                executor=self.executor,
+                optimizer=self.optimizer
+            )
+            self._initialized_resources.append('scheduler')
+            
+            # 8. 初始化 Web API
+            self.webapi = WebAPI(
+                scheduler=self.scheduler,
+                knowledge_graph=self.kg,
+                executor=self.executor,
+                optimizer=self.optimizer
+            )
+            self._initialized_resources.append('webapi')
+            
+            # 9. 存储初始知识
+            self._seed_knowledge()
+            
+            logger.info("SoloAgent 初始化完成!")
+            
+        except Exception as e:
+            logger.error(f"SoloAgent 初始化失败: {e}", exc_info=True)
+            # 清理已初始化的资源
+            self._cleanup_resources()
+            raise
+    
+    def _cleanup_resources(self):
+        """清理已初始化的资源"""
+        # 按相反顺序清理
+        for resource in reversed(self._initialized_resources):
+            try:
+                if resource == 'kg' and self.kg:
+                    self.kg.close()
+                    logger.debug("知识图谱已关闭")
+                elif resource == 'scheduler' and self.scheduler:
+                    self.scheduler.stop()
+                    logger.debug("调度器已停止")
+            except Exception as e:
+                logger.warning(f"清理资源 {resource} 时出错: {e}")
+        self._initialized_resources.clear()
     
     def _seed_knowledge(self):
         """注入初始知识 - Agent 的第一份经验"""
@@ -135,17 +172,36 @@ class SoloAgent:
             logger.info(f"已加载 {len(examples)} 个示例任务")
         
         if with_api:
+            # 使用 Event 检测 API 线程是否成功启动
+            self._api_started = threading.Event()
+            self._api_error = None
+            
+            def run_api_with_event():
+                try:
+                    self.webapi.run(
+                        host=self.config.webapi.host,
+                        port=self.config.webapi.port,
+                        debug=self.config.webapi.debug
+                    )
+                except Exception as e:
+                    self._api_error = e
+                    self._api_started.set()  # 即使失败也设置事件，避免死锁
+            
             # API 在独立线程运行
             self._api_thread = threading.Thread(
-                target=self.webapi.run,
-                kwargs={
-                    "host": self.config.webapi.host,
-                    "port": self.config.webapi.port,
-                    "debug": self.config.webapi.debug
-                },
+                target=run_api_with_event,
                 daemon=True
             )
             self._api_thread.start()
+            
+            # 等待一小段时间确认线程启动
+            import time
+            time.sleep(0.5)
+            
+            if self._api_error:
+                logger.error(f"Web API 启动失败: {self._api_error}")
+                raise RuntimeError(f"Web API 启动失败: {self._api_error}")
+            
             logger.info(
                 f"Web API 已在后台启动: "
                 f"http://{self.config.webapi.host}:{self.config.webapi.port}"
@@ -156,7 +212,8 @@ class SoloAgent:
             self.scheduler.start()
         finally:
             self.scheduler.stop()
-            self.kg.close()
+            if self.kg:
+                self.kg.close()
             logger.info("Agent 已停止，资源已清理")
     
     def run_cli(self):
@@ -359,24 +416,39 @@ def main():
     
     args = parser.parse_args()
     
-    # 创建 Agent
-    agent = SoloAgent(config_path=args.config)
+    agent = None
+    try:
+        # 创建 Agent
+        agent = SoloAgent(config_path=args.config)
+        
+        # 命令行覆盖配置
+        if args.api_key:
+            agent.config.llm.api_key = args.api_key
+        if args.port is not None:
+            agent.config.webapi.port = args.port
+        
+        # 根据模式启动
+        if args.mode == 'cli':
+            agent.run_cli()
+        elif args.mode == 'daemon':
+            # daemon 模式：后台运行 Agent 主循环 + Web API，行为与 api 模式一致
+            agent.run(with_api=True, load_examples=not args.no_examples)
+        elif args.mode == 'api':
+            # api 模式：后台运行 Agent 主循环 + Web API，行为与 daemon 模式一致
+            agent.run(with_api=True, load_examples=not args.no_examples)
     
-    # 命令行覆盖配置
-    if args.api_key:
-        agent.config.llm.api_key = args.api_key
-    if args.port is not None:
-        agent.config.webapi.port = args.port
-    
-    # 根据模式启动
-    if args.mode == 'cli':
-        agent.run_cli()
-    elif args.mode == 'daemon':
-        # daemon 模式：后台运行 Agent 主循环 + Web API，行为与 api 模式一致
-        agent.run(with_api=True, load_examples=not args.no_examples)
-    elif args.mode == 'api':
-        # api 模式：后台运行 Agent 主循环 + Web API，行为与 daemon 模式一致
-        agent.run(with_api=True, load_examples=not args.no_examples)
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在退出...")
+    except Exception as e:
+        logger.error(f"Agent 运行失败: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        # 确保资源清理
+        if agent and hasattr(agent, '_cleanup_resources'):
+            try:
+                agent._cleanup_resources()
+            except Exception as e:
+                logger.warning(f"清理资源时出错: {e}")
 
 
 if __name__ == '__main__':

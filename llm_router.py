@@ -89,6 +89,9 @@ class BaseLLMProvider(ABC):
         messages.append({"role": "user", "content": user_message})
         
         response = self.chat(messages)
+        # Bug修复 #15: response 可能为 None
+        if response is None:
+            return ""
         return response.content if response.success else ""
     
     def get_stats(self) -> Dict:
@@ -137,6 +140,9 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             "max_tokens": kwargs.get("max_tokens", self.config.max_tokens),
             "stream": False
         }
+        
+        # Bug修复 #16: 初始化 error 变量，防止 max_retries == 0 时未定义
+        error = "未知错误"
         
         for attempt in range(self.config.max_retries):
             try:
@@ -417,6 +423,7 @@ class LLMRouter:
         # 尝试每个提供商
         last_error = ""
         for provider in providers_to_try:
+            start_time = time.time()
             try:
                 response = provider.chat(messages, **kwargs)
                 if response.success:
@@ -424,7 +431,9 @@ class LLMRouter:
                 last_error = response.error
                 logger.warning(f"提供商 {provider.config.name} 失败: {last_error}，尝试下一个...")
             except Exception as e:
-                # ★ Bug修复：捕获 provider 异常，继续尝试下一个
+                # Bug修复 #22: 异常时更新统计
+                latency_ms = (time.time() - start_time) * 1000
+                provider._update_stats(False, 0, latency_ms, str(e))
                 last_error = str(e)
                 logger.warning(f"提供商 {provider.config.name} 异常: {e}，尝试下一个...")
         
