@@ -11,11 +11,13 @@ import time
 import uuid
 import logging
 import threading
+import multiprocessing
 import networkx as nx
 from typing import Optional, List, Dict, Any
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from filelock import FileLock, Timeout
 
 logger = logging.getLogger("agent.knowledge")
 
@@ -79,7 +81,11 @@ class KnowledgeGraph:
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else '.', exist_ok=True)
         self._graph = nx.DiGraph()
         self._lock = threading.RLock()  # 线程安全锁（可重入，支持同一线程嵌套获取）
+        # [R17-修复] 添加进程级文件锁，解决多进程并发访问问题
+        self._file_lock_path = db_path + ".lock"
+        self._file_lock = FileLock(self._file_lock_path, timeout=30)
         self._conn = None
+        self._conn_pid = None  # [R17-修复] 记录连接所属的进程ID
         self._last_sync_version = 0  # 用于多实例同步
         self._init_db()
         self._load_from_db()
@@ -87,12 +93,21 @@ class KnowledgeGraph:
         logger.info(f"知识图谱初始化完成: {self._graph.number_of_nodes()} 节点, {self._graph.number_of_edges()} 边")
     
     def _get_conn(self) -> sqlite3.Connection:
-        """获取数据库连接（线程安全）"""
-        # [修复5] 在 _get_conn() 中添加 self._lock 保护，防止多线程同时创建连接导致竞态条件
+        """获取数据库连接（线程安全+进程安全）"""
+        # [R17-修复] 检查当前进程ID，如果变化则重新创建连接（多进程安全）
+        current_pid = multiprocessing.current_process().pid
+        
         with self._lock:
-            if self._conn is None:
+            # [R17-修复] 如果进程变化或连接未创建，需要新建连接
+            if self._conn is None or self._conn_pid != current_pid:
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
                 self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
                 self._conn.row_factory = sqlite3.Row
+                self._conn_pid = current_pid
                 # 启用 WAL 模式提高并发性能
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -289,39 +304,41 @@ class KnowledgeGraph:
     # ---- 节点操作 ----
     
     def add_node(self, node: KnowledgeNode) -> str:
-        """添加知识节点（线程安全），已存在的节点不会被覆盖"""
-        with self._lock:
-            conn = self._get_conn()
-            cursor = conn.execute(
-                """INSERT OR IGNORE INTO nodes 
-                   (id, title, content, category, tags, metadata, created_at, updated_at, importance)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (node.id, node.title, node.content, node.category,
-                 json.dumps(node.tags, ensure_ascii=False),
-                 json.dumps(node.metadata, ensure_ascii=False),
-                 node.created_at, node.updated_at, node.importance)
-            )
-            conn.commit()
-            # 更新版本号，确保后续 _sync_and_lock 能检测到变化
-            self._last_sync_version = self._get_db_version()
-            if cursor.rowcount > 0:
-                # 只有实际插入了新行才更新内存图
-                self._graph.add_node(node.id, **asdict(node))
-                logger.debug(f"添加节点: {node.title} [{node.category}]")
-            else:
-                # 节点已存在，从SQLite同步最新数据到内存图
-                row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone()
-                if row:
-                    existing = KnowledgeNode(
-                        id=row['id'], title=row['title'], content=row['content'],
-                        category=row['category'], tags=json.loads(row['tags']),
-                        metadata=json.loads(row['metadata']),
-                        created_at=row['created_at'], updated_at=row['updated_at'],
-                        importance=row['importance']
-                    )
-                    self._graph.add_node(existing.id, **asdict(existing))
-                    logger.debug(f"节点已存在，同步: {existing.title}")
-            return node.id
+        """添加知识节点（线程安全+进程安全），已存在的节点不会被覆盖"""
+        # [R17-修复] 使用文件锁保护多进程并发写入
+        with self._file_lock:
+            with self._lock:
+                conn = self._get_conn()
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO nodes 
+                       (id, title, content, category, tags, metadata, created_at, updated_at, importance)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (node.id, node.title, node.content, node.category,
+                     json.dumps(node.tags, ensure_ascii=False),
+                     json.dumps(node.metadata, ensure_ascii=False),
+                     node.created_at, node.updated_at, node.importance)
+                )
+                conn.commit()
+                # 更新版本号，确保后续 _sync_and_lock 能检测到变化
+                self._last_sync_version = self._get_db_version()
+                if cursor.rowcount > 0:
+                    # 只有实际插入了新行才更新内存图
+                    self._graph.add_node(node.id, **asdict(node))
+                    logger.debug(f"添加节点: {node.title} [{node.category}]")
+                else:
+                    # 节点已存在，从SQLite同步最新数据到内存图
+                    row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone()
+                    if row:
+                        existing = KnowledgeNode(
+                            id=row['id'], title=row['title'], content=row['content'],
+                            category=row['category'], tags=json.loads(row['tags']),
+                            metadata=json.loads(row['metadata']),
+                            created_at=row['created_at'], updated_at=row['updated_at'],
+                            importance=row['importance']
+                        )
+                        self._graph.add_node(existing.id, **asdict(existing))
+                        logger.debug(f"节点已存在，同步: {existing.title}")
+                return node.id
     
     def get_node(self, node_id: str) -> Optional[Dict]:
         """获取节点"""

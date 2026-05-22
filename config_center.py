@@ -13,6 +13,7 @@ import threading
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from filelock import FileLock
 
 logger = logging.getLogger("agent.config_center")
 
@@ -95,6 +96,9 @@ class ConfigCenter:
         self._last_modified = 0
         self._observer: Optional[Observer] = None
         self._watching = False
+        # [R17-修复] 添加进程级文件锁，解决多进程并发访问问题
+        self._file_lock_path = config_path + ".lock"
+        self._file_lock = FileLock(self._file_lock_path, timeout=30)
         
         # 初始化 schema
         self._init_default_schema()
@@ -123,31 +127,33 @@ class ConfigCenter:
             self._schema[schema.key] = schema
     
     def load(self) -> bool:
-        """加载配置文件"""
-        try:
-            if not os.path.exists(self.config_path):
-                logger.warning(f"配置文件不存在: {self.config_path}，使用默认值")
+        """加载配置文件（进程安全）"""
+        # [R17-修复] 使用文件锁保护多进程并发读取
+        with self._file_lock:
+            try:
+                if not os.path.exists(self.config_path):
+                    logger.warning(f"配置文件不存在: {self.config_path}，使用默认值")
+                    self._apply_defaults()
+                    return False
+                
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
+                        import yaml
+                        loaded = yaml.safe_load(f) or {}
+                    else:
+                        loaded = json.load(f)
+                
+                # 验证并应用配置
+                self._validate_and_apply(loaded)
+                
+                self._last_modified = os.path.getmtime(self.config_path)
+                logger.info(f"配置加载成功: {self.config_path}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"配置加载失败: {e}")
                 self._apply_defaults()
                 return False
-            
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
-                    import yaml
-                    loaded = yaml.safe_load(f) or {}
-                else:
-                    loaded = json.load(f)
-            
-            # 验证并应用配置
-            self._validate_and_apply(loaded)
-            
-            self._last_modified = os.path.getmtime(self.config_path)
-            logger.info(f"配置加载成功: {self.config_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"配置加载失败: {e}")
-            self._apply_defaults()
-            return False
     
     def _validate_and_apply(self, config: Dict):
         """验证并应用配置"""
@@ -265,6 +271,35 @@ class ConfigCenter:
             
             return True
     
+    def set_and_save(self, key: str, value: Any, source: str = "api") -> bool:
+        """
+        原子性设置配置并保存到文件（进程安全）
+        [R17-修复] 解决多进程配置更新丢失问题
+        """
+        # 使用文件锁确保整个操作原子性
+        with self._file_lock:
+            # 先重新加载配置，确保基于最新状态
+            if os.path.exists(self.config_path):
+                try:
+                    with open(self.config_path, 'r', encoding='utf-8') as f:
+                        if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
+                            import yaml
+                            latest_config = yaml.safe_load(f) or {}
+                        else:
+                            latest_config = json.load(f)
+                    # 合并最新配置
+                    with self._lock:
+                        self._config.update(latest_config)
+                except Exception as e:
+                    logger.warning(f"重新加载配置失败: {e}")
+            
+            # 设置新值
+            if not self.set(key, value, source):
+                return False
+            
+            # 立即保存
+            return self.save()
+    
     def register_listener(self, key: str, callback: Callable):
         """注册特定配置项的变更监听器"""
         with self._lock:
@@ -343,33 +378,35 @@ class ConfigCenter:
             logger.info("配置热更新监听已停止")
     
     def save(self) -> bool:
-        """保存配置到文件（原子写入）"""
-        try:
-            with self._lock:
-                config_copy = dict(self._config)
+        """保存配置到文件（原子写入+进程安全）"""
+        # [R17-修复] 使用文件锁保护多进程并发写入
+        with self._file_lock:
+            try:
+                with self._lock:
+                    config_copy = dict(self._config)
 
-            # 先写入临时文件，再原子替换，保证写入原子性
-            tmp_path = self.config_path + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
-                    import yaml
-                    yaml.dump(config_copy, f, allow_unicode=True, default_flow_style=False)
-                else:
-                    json.dump(config_copy, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self.config_path)
+                # [R17-修复] 使用唯一临时文件名，避免多进程冲突
+                import uuid as uuid_mod
+                tmp_path = self.config_path + f'.tmp.{uuid_mod.uuid4().hex}'
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
+                        import yaml
+                        yaml.dump(config_copy, f, allow_unicode=True, default_flow_style=False)
+                    else:
+                        json.dump(config_copy, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self.config_path)
 
-            logger.info(f"配置已保存: {self.config_path}")
-            return True
-        except Exception as e:
-            logger.error(f"配置保存失败: {e}")
-            # 清理可能残留的临时文件
-            tmp_path = self.config_path + '.tmp'
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            return False
+                logger.info(f"配置已保存: {self.config_path}")
+                return True
+            except Exception as e:
+                logger.error(f"配置保存失败: {e}")
+                # 清理可能残留的临时文件
+                if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                return False
     
     def get_all(self) -> Dict:
         """获取所有配置"""
