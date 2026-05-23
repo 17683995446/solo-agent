@@ -103,8 +103,13 @@ class Optimizer:
                     if batch_result is None:
                         with self._lock:
                             # 将数据恢复到队列头部，避免数据丢失
-                            self._pending_successes = batch_data + self._pending_successes
-                            logger.debug(f"批量分析失败，已恢复 {len(batch_data)} 条数据到待处理队列")
+                            # 但限制最大长度为 200 条，超过则丢弃最旧的数据
+                            combined = batch_data + self._pending_successes
+                            if len(combined) > 200:
+                                combined = combined[-200:]
+                                logger.warning(f"待处理队列超过200条限制，已丢弃最旧的数据")
+                            self._pending_successes = combined
+                            logger.debug(f"批量分析失败，已恢复 {len(combined)} 条数据到待处理队列")
                     return batch_result
 
         return None
@@ -141,6 +146,9 @@ class Optimizer:
                 with self._lock:
                     self._optimization_history.append(record)
                     self._stats["optimizations_proposed"] += 1
+                    # 大小限制：超过 1000 条则截断为保留后 500 条
+                    if len(self._optimization_history) > 1000:
+                        self._optimization_history = self._optimization_history[-500:]
 
                 # 存入知识图谱
                 if self.kg:
@@ -184,6 +192,9 @@ class Optimizer:
                 with self._lock:
                     self._optimization_history.append(record)
                     self._stats["optimizations_proposed"] += 1
+                    # 大小限制：超过 1000 条则截断为保留后 500 条
+                    if len(self._optimization_history) > 1000:
+                        self._optimization_history = self._optimization_history[-500:]
                 logger.info(f"  📊 批量成功分析完成")
                 return record
         except Exception as e:
@@ -225,6 +236,9 @@ class Optimizer:
         with self._lock:
             self._optimization_history.append(record)
             self._stats["optimizations_proposed"] += 1
+            # 大小限制：超过 1000 条则截断为保留后 500 条
+            if len(self._optimization_history) > 1000:
+                self._optimization_history = self._optimization_history[-500:]
 
         # 存入知识图谱
         if self.kg:

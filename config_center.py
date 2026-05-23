@@ -271,6 +271,16 @@ class ConfigCenter:
             
             return True
     
+    def _deep_merge(self, base: Dict, override: Dict) -> Dict:
+        """深度合并两个字典，递归合并嵌套的字典值"""
+        result = dict(base)
+        for key, value in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+
     def set_and_save(self, key: str, value: Any, source: str = "api") -> bool:
         """
         原子性设置配置并保存到文件（进程安全）
@@ -287,9 +297,9 @@ class ConfigCenter:
                             latest_config = yaml.safe_load(f) or {}
                         else:
                             latest_config = json.load(f)
-                    # 合并最新配置
+                    # 深度合并最新配置，避免浅合并覆盖嵌套配置
                     with self._lock:
-                        self._config.update(latest_config)
+                        self._config = self._deep_merge(self._config, latest_config)
                 except Exception as e:
                     logger.warning(f"重新加载配置失败: {e}")
             
@@ -313,25 +323,30 @@ class ConfigCenter:
             self._global_listeners.append(callback)
     
     def _notify_change(self, key: str, old_value: Any, new_value: Any, source: str):
-        """通知配置变更"""
+        """通知配置变更。注意：此方法必须在 _lock 保护下调用，调用者负责持锁。"""
         event = ConfigChangeEvent(key, old_value, new_value, source)
         
-        # 先在锁内收集需要通知的回调
-        with self._lock:
-            callbacks = list(self._listeners.get(key, []))
-            global_callbacks = list(self._global_listeners)
+        # 在锁内收集需要通知的回调（调用者已持有 _lock，此处不再重复获取）
+        callbacks = list(self._listeners.get(key, []))
+        global_callbacks = list(self._global_listeners)
         
         # 释放锁后再调用回调
-        for callback in callbacks:
-            try:
-                callback(event)
-            except Exception as e:
-                logger.warning(f"配置变更监听器异常: {e}")
-        for callback in global_callbacks:
-            try:
-                callback(event)
-            except Exception as e:
-                logger.warning(f"全局配置监听器异常: {e}")
+        # 注意：由于使用 RLock，同一线程可重入，但回调中不应依赖锁
+        # 为避免回调中修改 listeners 导致问题，先释放锁再调用回调
+        self._lock.release()
+        try:
+            for callback in callbacks:
+                try:
+                    callback(event)
+                except Exception as e:
+                    logger.warning(f"配置变更监听器异常: {e}")
+            for callback in global_callbacks:
+                try:
+                    callback(event)
+                except Exception as e:
+                    logger.warning(f"全局配置监听器异常: {e}")
+        finally:
+            self._lock.acquire()
         
         logger.info(f"配置变更: {key} = {new_value} (来源: {source})")
     

@@ -347,6 +347,10 @@ class TaskExecutor:
            只暴露 abs/round/min/max/pow/sum 等安全数学函数
         3. 危险模式检查：禁止 __、方括号[]（防止属性访问和下标越界）
         """
+        # 防御：确保 task.params 不为 None
+        if task.params is None:
+            task.params = {}
+
         # ★ Bug修复：兼容 expr 和 expression 两种参数名
         expr = task.params.get("expr") or task.params.get("expression") or task.description
 
@@ -607,7 +611,7 @@ class TaskExecutor:
         
         for i, step in enumerate(steps):
             step_type = step.get("type", "echo")
-            step_params = step.get("params", {})
+            step_params = dict(step.get("params", {}))
             
             # 将上一步结果注入参数
             if carry_over:

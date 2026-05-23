@@ -5,6 +5,7 @@
 """
 
 import os
+import hashlib
 import json
 import sqlite3
 import time
@@ -40,7 +41,9 @@ class KnowledgeNode:
     
     def __post_init__(self):
         if not self.id:
-            self.id = f"n_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}_{hash(self.title) % 10000}"
+            # [Bug4修复] 使用 hashlib 生成确定性哈希，避免 Python hash() 跨进程不稳定
+            hash_val = int(hashlib.md5(self.title.encode()).hexdigest()[:8], 16) % 10000
+            self.id = f"n_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}_{hash_val}"
         if not self.created_at:
             self.created_at = datetime.now().isoformat()
         if not self.updated_at:
@@ -114,33 +117,27 @@ class KnowledgeGraph:
             return self._conn
     
     def _get_db_version(self) -> int:
-        """获取数据库版本号（用于多实例同步），包含节点和边的变更"""
+        """获取数据库版本号（用于多实例同步），从 db_meta 表读取"""
         try:
             conn = self._get_conn()
-            cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(id) as max_id FROM nodes")
-            row = cursor.fetchone()
-            node_count = row['cnt'] if row else 0
-            max_node_id = row['max_id'] if row and row['max_id'] else ""
-            version = node_count * 1000000
-            if max_node_id:
-                try:
-                    nums = [int(s) for s in max_node_id.replace('n_', '').split('_') if s.isdigit()]
-                    for n in nums:
-                        version += n
-                except (ValueError, AttributeError):
-                    pass
-
-            # 包含边的变更信息：边数量 + 最大边ID
-            cursor = conn.execute("SELECT COUNT(*) as cnt, MAX(id) as max_id FROM edges")
-            row = cursor.fetchone()
-            edge_count = row['cnt'] if row else 0
-            max_edge_id = row['max_id'] if row and row['max_id'] else 0
-            version += edge_count * 10000 + (max_edge_id or 0)
-
-            return version
+            row = conn.execute("SELECT value FROM db_meta WHERE key = 'db_version'").fetchone()
+            if row:
+                return int(row['value'])
+            return 0
         except Exception as e:
             logger.warning(f"获取数据库版本号失败: {e}")
             return 0
+
+    def _increment_db_version(self):
+        """递增数据库版本号（调用方必须已持有锁）"""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "UPDATE db_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'db_version'"
+            )
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"递增数据库版本号失败: {e}")
     
     def _check_need_sync(self) -> int:
         """无锁检查版本号，返回当前数据库版本（调用方无需持有锁）"""
@@ -266,12 +263,22 @@ class KnowledgeGraph:
                 FOREIGN KEY (target) REFERENCES nodes(id),
                 UNIQUE(source, target, relation)
             );
+
+            CREATE TABLE IF NOT EXISTS db_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             
             CREATE INDEX IF NOT EXISTS idx_nodes_category ON nodes(category);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
             CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
         """)
+        # [Bug7修复] 初始化 db_version，如果不存在则创建
+        row = conn.execute("SELECT value FROM db_meta WHERE key = 'db_version'").fetchone()
+        if row is None:
+            conn.execute("INSERT INTO db_meta (key, value) VALUES ('db_version', '0')")
+            conn.commit()
         conn.commit()
         logger.info("数据库表结构初始化完成")
     
@@ -319,7 +326,8 @@ class KnowledgeGraph:
                      node.created_at, node.updated_at, node.importance)
                 )
                 conn.commit()
-                # 更新版本号，确保后续 _sync_and_lock 能检测到变化
+                # [Bug7修复] 递增版本号，确保后续 _sync_and_lock 能检测到变化
+                self._increment_db_version()
                 self._last_sync_version = self._get_db_version()
                 if cursor.rowcount > 0:
                     # 只有实际插入了新行才更新内存图
@@ -384,61 +392,67 @@ class KnowledgeGraph:
             ]
     
     def delete_node(self, node_id: str) -> bool:
-        """删除节点及其关联边（线程安全）"""
-        with self._lock:
-            if node_id not in self._graph:
-                return False
-            conn = self._get_conn()
-            conn.execute("DELETE FROM edges WHERE source = ? OR target = ?", (node_id, node_id))
-            conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
-            conn.commit()
-            # 更新版本号
-            self._last_sync_version = self._get_db_version()
-            if node_id in self._graph:
-                self._graph.remove_node(node_id)
-            logger.debug(f"删除节点: {node_id}")
-            return True
+        """删除节点及其关联边（线程安全+进程安全）"""
+        # [Bug2修复] 使用文件锁保护多进程并发写入，与 add_node() 保持一致
+        with self._file_lock:
+            with self._lock:
+                if node_id not in self._graph:
+                    return False
+                conn = self._get_conn()
+                conn.execute("DELETE FROM edges WHERE source = ? OR target = ?", (node_id, node_id))
+                conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+                conn.commit()
+                # [Bug7修复] 递增版本号
+                self._increment_db_version()
+                self._last_sync_version = self._get_db_version()
+                if node_id in self._graph:
+                    self._graph.remove_node(node_id)
+                logger.debug(f"删除节点: {node_id}")
+                return True
     
     # ---- 边操作 ----
     
     def add_edge(self, edge: KnowledgeEdge) -> bool:
-        """添加关系边（线程安全），冲突时保留原始created_at"""
-        with self._lock:
-            if edge.source not in self._graph or edge.target not in self._graph:
-                logger.warning(f"边引用了不存在的节点: {edge.source} -> {edge.target}")
-                return False
-            
-            conn = self._get_conn()
-            try:
-                # 检查边是否已存在（用于决定created_at）
-                is_update = self._graph.has_edge(edge.source, edge.target)
-                existing_created_at = None
-                if is_update:
-                    existing_created_at = self._graph.edges[edge.source, edge.target].get('created_at', edge.created_at)
+        """添加关系边（线程安全+进程安全），冲突时保留原始created_at"""
+        # [Bug3修复] 使用文件锁保护多进程并发写入，与 add_node() 保持一致
+        with self._file_lock:
+            with self._lock:
+                if edge.source not in self._graph or edge.target not in self._graph:
+                    logger.warning(f"边引用了不存在的节点: {edge.source} -> {edge.target}")
+                    return False
+                
+                conn = self._get_conn()
+                try:
+                    # 检查边是否已存在（用于决定created_at）
+                    is_update = self._graph.has_edge(edge.source, edge.target)
+                    existing_created_at = None
+                    if is_update:
+                        existing_created_at = self._graph.edges[edge.source, edge.target].get('created_at', edge.created_at)
 
-                conn.execute(
-                    """INSERT INTO edges (source, target, relation, weight, metadata, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(source, target, relation) DO UPDATE SET weight=excluded.weight, metadata=excluded.metadata""",
-                    (edge.source, edge.target, edge.relation, edge.weight,
-                     json.dumps(edge.metadata, ensure_ascii=False), edge.created_at)
-                )
-                conn.commit()
-                # 更新版本号
-                self._last_sync_version = self._get_db_version()
+                    conn.execute(
+                        """INSERT INTO edges (source, target, relation, weight, metadata, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(source, target, relation) DO UPDATE SET weight=excluded.weight, metadata=excluded.metadata""",
+                        (edge.source, edge.target, edge.relation, edge.weight,
+                         json.dumps(edge.metadata, ensure_ascii=False), edge.created_at)
+                    )
+                    conn.commit()
+                    # [Bug7修复] 递增版本号
+                    self._increment_db_version()
+                    self._last_sync_version = self._get_db_version()
 
-                # 更新内存图：冲突时保留原始created_at
-                actual_created_at = existing_created_at if is_update else edge.created_at
-                self._graph.add_edge(
-                    edge.source, edge.target,
-                    relation=edge.relation, weight=edge.weight,
-                    metadata=edge.metadata, created_at=actual_created_at
-                )
-                logger.debug(f"添加边: {edge.source} -[{edge.relation}]-> {edge.target}")
-                return True
-            except Exception as e:
-                logger.error(f"添加边失败: {e}")
-                return False
+                    # 更新内存图：冲突时保留原始created_at
+                    actual_created_at = existing_created_at if is_update else edge.created_at
+                    self._graph.add_edge(
+                        edge.source, edge.target,
+                        relation=edge.relation, weight=edge.weight,
+                        metadata=edge.metadata, created_at=actual_created_at
+                    )
+                    logger.debug(f"添加边: {edge.source} -[{edge.relation}]-> {edge.target}")
+                    return True
+                except Exception as e:
+                    logger.error(f"添加边失败: {e}")
+                    return False
     
     def get_neighbors(self, node_id: str, relation: Optional[str] = None) -> List[Dict]:
         """获取邻居节点"""
@@ -530,66 +544,71 @@ class KnowledgeGraph:
             importance=importance
         )
 
-        with self._lock:
-            conn = self._get_conn()
+        # [Bug1修复] 使用文件锁保护多进程并发写入，与 add_node() 保持一致
+        with self._file_lock:
+            with self._lock:
+                conn = self._get_conn()
 
-            # 直接写入 SQLite（与 add_node 内部逻辑一致）
-            cursor = conn.execute(
-                """INSERT OR IGNORE INTO nodes
-                   (id, title, content, category, tags, metadata, created_at, updated_at, importance)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (node.id, node.title, node.content, node.category,
-                 json.dumps(node.tags, ensure_ascii=False),
-                 json.dumps(node.metadata, ensure_ascii=False),
-                 node.created_at, node.updated_at, node.importance)
-            )
+                # 直接写入 SQLite（与 add_node 内部逻辑一致）
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO nodes
+                       (id, title, content, category, tags, metadata, created_at, updated_at, importance)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (node.id, node.title, node.content, node.category,
+                     json.dumps(node.tags, ensure_ascii=False),
+                     json.dumps(node.metadata, ensure_ascii=False),
+                     node.created_at, node.updated_at, node.importance)
+                )
 
-            # 与 add_node 保持一致：检查是否实际插入了新行
-            if cursor.rowcount > 0:
-                self._graph.add_node(node.id, **asdict(node))
-            else:
-                # 节点已存在，从数据库同步最新数据到内存图
-                row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone()
-                if row:
-                    existing = KnowledgeNode(
-                        id=row['id'], title=row['title'], content=row['content'],
-                        category=row['category'], tags=json.loads(row['tags']),
-                        metadata=json.loads(row['metadata']),
-                        created_at=row['created_at'], updated_at=row['updated_at'],
-                        importance=row['importance']
-                    )
-                    self._graph.add_node(existing.id, **asdict(existing))
-
-            # 建立关联边（直接操作，不调用 add_edge）
-            if related_to:
-                for rel_id in related_to:
-                    if rel_id in self._graph:
-                        edge = KnowledgeEdge(
-                            source=node.id, target=rel_id,
-                            relation="related_to"
+                # 与 add_node 保持一致：检查是否实际插入了新行
+                if cursor.rowcount > 0:
+                    self._graph.add_node(node.id, **asdict(node))
+                else:
+                    # 节点已存在，从数据库同步最新数据到内存图
+                    row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node.id,)).fetchone()
+                    if row:
+                        existing = KnowledgeNode(
+                            id=row['id'], title=row['title'], content=row['content'],
+                            category=row['category'], tags=json.loads(row['tags']),
+                            metadata=json.loads(row['metadata']),
+                            created_at=row['created_at'], updated_at=row['updated_at'],
+                            importance=row['importance']
                         )
-                        try:
-                            conn.execute(
-                                """INSERT OR REPLACE INTO edges (source, target, relation, weight, metadata, created_at)
-                                   VALUES (?, ?, ?, ?, ?, ?)""",
-                                (edge.source, edge.target, edge.relation, edge.weight,
-                                 json.dumps(edge.metadata, ensure_ascii=False), edge.created_at)
+                        self._graph.add_node(existing.id, **asdict(existing))
+
+                # 建立关联边（直接操作，不调用 add_edge）
+                if related_to:
+                    for rel_id in related_to:
+                        if rel_id in self._graph:
+                            edge = KnowledgeEdge(
+                                source=node.id, target=rel_id,
+                                relation="related_to"
                             )
-                            self._graph.add_edge(
-                                edge.source, edge.target,
-                                relation=edge.relation, weight=edge.weight,
-                                metadata=edge.metadata, created_at=edge.created_at
-                            )
-                        except Exception as e:
-                            logger.error(f"添加边失败: {e}")
+                            try:
+                                # [Bug5修复] 使用 INSERT ... ON CONFLICT DO UPDATE 保留原始 created_at
+                                conn.execute(
+                                    """INSERT INTO edges (source, target, relation, weight, metadata, created_at)
+                                       VALUES (?, ?, ?, ?, ?, ?)
+                                       ON CONFLICT(source, target, relation) DO UPDATE SET weight=excluded.weight, metadata=excluded.metadata""",
+                                    (edge.source, edge.target, edge.relation, edge.weight,
+                                     json.dumps(edge.metadata, ensure_ascii=False), edge.created_at)
+                                )
+                                self._graph.add_edge(
+                                    edge.source, edge.target,
+                                    relation=edge.relation, weight=edge.weight,
+                                    metadata=edge.metadata, created_at=edge.created_at
+                                )
+                            except Exception as e:
+                                logger.error(f"添加边失败: {e}")
 
-            conn.commit()
+                conn.commit()
 
-            # 写入改变了数据库版本，更新同步版本号
-            self._last_sync_version = self._get_db_version()
+                # [Bug7修复] 递增版本号，更新同步版本号
+                self._increment_db_version()
+                self._last_sync_version = self._get_db_version()
 
-            logger.debug(f"存储经验: {node.title} [{node.category}]")
-            return node.id
+                logger.debug(f"存储经验: {node.title} [{node.category}]")
+                return node.id
     
     def query_experience(self, query: str, limit: int = 10) -> List[Dict]:
         """查询相关经验"""
@@ -691,6 +710,19 @@ class KnowledgeGraph:
                 self._conn.close()
                 self._conn = None
                 logger.info("知识图谱数据库连接已关闭")
+        # [Bug6修复] 释放文件锁并清理锁文件
+        try:
+            self._file_lock.release()
+            logger.info("知识图谱文件锁已释放")
+        except Exception:
+            pass
+        # 清理锁文件
+        try:
+            if os.path.exists(self._file_lock_path):
+                os.remove(self._file_lock_path)
+                logger.info("知识图谱锁文件已清理")
+        except Exception as e:
+            logger.warning(f"清理锁文件失败: {e}")
 
     def __enter__(self):
         return self

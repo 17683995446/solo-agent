@@ -230,55 +230,73 @@ class OllamaProvider(BaseLLMProvider):
             }
         }
         
-        try:
-            response = requests.post(
-                f"{self.config.api_url}/api/chat",
-                json=payload,
-                timeout=self.config.timeout
-            )
-            response.raise_for_status()
+        # 初始化 error 变量，防止 max_retries == 0 时未定义
+        error = "未知错误"
+        
+        for attempt in range(self.config.max_retries):
+            try:
+                response = requests.post(
+                    f"{self.config.api_url}/api/chat",
+                    json=payload,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                
+                data = response.json()
+                # Bug修复 #7: 防御性检查 — 确保 message 字段存在
+                message = data.get('message')
+                if not message or not message.get('content'):
+                    raise ValueError(f"Ollama API响应格式异常: 缺少message或content字段")
+                content = message['content']
+                
+                # Ollama不返回token计数，估算
+                tokens_prompt = sum(len(m['content']) // 4 for m in messages)
+                tokens_completion = len(content) // 4
+                tokens_total = tokens_prompt + tokens_completion
+                
+                latency_ms = (time.time() - start_time) * 1000
+                
+                self._update_stats(True, tokens_total, latency_ms)
+                
+                return LLMResponse(
+                    content=content,
+                    model=self.config.model,
+                    provider=self.config.name,
+                    tokens_used=tokens_total,
+                    tokens_prompt=tokens_prompt,
+                    tokens_completion=tokens_completion,
+                    latency_ms=latency_ms,
+                    cost=0.0,  # 本地模型无成本
+                    success=True
+                )
+                
+            except requests.exceptions.Timeout:
+                error = f"请求超时 ({self.config.timeout}s)"
+                
+            except requests.exceptions.HTTPError as e:
+                error = f"HTTP错误: {e.response.status_code}"
+                # 某些错误不需要重试
+                if e.response.status_code in [401, 403, 429]:
+                    break
+                    
+            except Exception as e:
+                error = f"{type(e).__name__}: {str(e)}"
             
-            data = response.json()
-            # Bug修复 #7: 防御性检查 — 确保 message 字段存在
-            message = data.get('message')
-            if not message or not message.get('content'):
-                raise ValueError(f"Ollama API响应格式异常: 缺少message或content字段")
-            content = message['content']
-            
-            # Ollama不返回token计数，估算
-            tokens_prompt = sum(len(m['content']) // 4 for m in messages)
-            tokens_completion = len(content) // 4
-            tokens_total = tokens_prompt + tokens_completion
-            
-            latency_ms = (time.time() - start_time) * 1000
-            
-            self._update_stats(True, tokens_total, latency_ms)
-            
-            return LLMResponse(
-                content=content,
-                model=self.config.model,
-                provider=self.config.name,
-                tokens_used=tokens_total,
-                tokens_prompt=tokens_prompt,
-                tokens_completion=tokens_completion,
-                latency_ms=latency_ms,
-                cost=0.0,  # 本地模型无成本
-                success=True
-            )
-            
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            error = f"{type(e).__name__}: {str(e)}"
-            self._update_stats(False, 0, latency_ms, error)
-            
-            return LLMResponse(
-                content="",
-                model=self.config.model,
-                provider=self.config.name,
-                latency_ms=latency_ms,
-                success=False,
-                error=error
-            )
+            if attempt < self.config.max_retries - 1:
+                time.sleep(self.config.retry_delay * (attempt + 1))
+        
+        # 所有重试失败
+        latency_ms = (time.time() - start_time) * 1000
+        self._update_stats(False, 0, latency_ms, error)
+        
+        return LLMResponse(
+            content="",
+            model=self.config.model,
+            provider=self.config.name,
+            latency_ms=latency_ms,
+            success=False,
+            error=error
+        )
 
 
 class LLMRouter:
@@ -458,13 +476,15 @@ class LLMRouter:
     
     def get_all_stats(self) -> Dict[str, Dict]:
         """获取所有提供商的统计"""
+        # 使用 list() 创建快照，避免遍历期间字典被修改
         return {
             name: provider.get_stats()
-            for name, provider in self._providers.items()
+            for name, provider in list(self._providers.items())
         }
     
     def get_provider_list(self) -> List[Dict]:
         """获取提供商列表"""
+        # 使用 list() 创建快照，避免遍历期间字典被修改
         return [
             {
                 "name": p.config.name,
@@ -476,7 +496,7 @@ class LLMRouter:
                 "cost_per_1k": p.config.cost_per_1k_tokens,
                 "stats": p.get_stats()
             }
-            for p in self._providers.values()
+            for p in list(self._providers.values())
         ]
 
 

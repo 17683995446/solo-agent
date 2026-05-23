@@ -177,6 +177,8 @@ class PluginManager:
         
         if not instance.initialize():
             logger.error(f"插件 {info.name} 初始化失败")
+            # 初始化失败后清理 sys.modules
+            sys.modules.pop(spec.name, None)
             return None
         
         with self._lock:
@@ -203,9 +205,16 @@ class PluginManager:
         # 读取并执行文件内容（耗时操作，不在锁内执行）
         # 安全警告：exec()执行外部代码存在风险，请确保插件来源可信
         logger.warning(f"正在加载外部插件: {plugin_file}，请确保来源可信")
-        with open(plugin_file, 'r', encoding='utf-8') as f:
-            code = f.read()
-        exec(compile(code, str(plugin_file), 'exec'), module.__dict__)
+        try:
+            with open(plugin_file, 'r', encoding='utf-8') as f:
+                code = f.read()
+            exec(compile(code, str(plugin_file), 'exec'), module.__dict__)
+        except Exception as e:
+            # exec() 失败后清理 sys.modules
+            sys.modules.pop(module_name, None)
+            logger.error(f"插件文件 {plugin_file} 执行失败: {e}")
+            logger.debug(traceback.format_exc())
+            return None
         
         # 查找插件类（继承PluginInterface）
         plugin_class = None

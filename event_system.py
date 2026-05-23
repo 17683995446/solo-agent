@@ -91,7 +91,7 @@ class EventBus:
     def __init__(self):
         self._handlers: Dict[EventType, List[Callable]] = {}
         self._async_handlers: Dict[EventType, List[Callable]] = {}
-        self._event_queue: asyncio.Queue = asyncio.Queue()
+        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._processor_task: Optional[asyncio.Task] = None
@@ -287,14 +287,9 @@ class EventBus:
                     # 检查是否已在事件循环中
                     try:
                         loop = asyncio.get_running_loop()
-                        # 已在事件循环中，使用 run_coroutine_threadsafe 或创建任务
-                        if self._loop and self._loop.is_running():
-                            # 使用 call_soon_threadsafe 安全调度
-                            future = asyncio.run_coroutine_threadsafe(handler(event), self._loop)
-                            future.result(timeout=5.0)  # 等待完成，最多5秒
-                        else:
-                            # 当前循环可用，创建任务
-                            asyncio.create_task(handler(event))
+                        # 已在事件循环中，使用 ensure_future 避免死锁
+                        # 不能使用 run_coroutine_threadsafe + future.result()，因为会死锁
+                        asyncio.ensure_future(handler(event))
                     except RuntimeError:
                         # 不在事件循环中，创建新的
                         asyncio.run(handler(event))

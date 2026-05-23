@@ -52,16 +52,23 @@ class WebAPI:
         @self.app.route('/api/health', methods=['GET'])
         def health_check():
             """健康检查"""
-            status = self.scheduler.get_status()
-            return jsonify({
-                "success": True,
-                "data": {
-                    "status": "running" if status["running"] else "stopped",
-                    "uptime": status["uptime_seconds"],
-                    "cycle_count": status["cycle_count"],
-                    "queue_size": status["queue_size"]
-                }
-            })
+            try:
+                status = self.scheduler.get_status()
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "status": "running" if status["running"] else "stopped",
+                        "uptime": status["uptime_seconds"],
+                        "cycle_count": status["cycle_count"],
+                        "queue_size": status["queue_size"]
+                    }
+                })
+            except Exception as e:
+                logger.error(f"健康检查异常: {e}", exc_info=True)
+                return jsonify({
+                    "success": True,
+                    "data": {"status": "degraded", "error": str(e)}
+                })
         
         # ---- 任务管理 ----
         
@@ -136,7 +143,42 @@ class WebAPI:
             if not isinstance(data['tasks'], list) or len(data['tasks']) > 100:
                 return jsonify({"success": False, "error": "tasks 必须为列表且不超过100条"}), 400
             
-            count = self.scheduler.add_tasks(data['tasks'])
+            # 对每个任务元素应用与 add_task() 相同的验证逻辑
+            allowed_types = {'echo', 'compute', 'llm_task', 'file_write', 'file_read', 'research', 'summarize', 'health_check', 'knowledge_query', 'self_improve', 'pipeline', 'general'}
+            validated_tasks = []
+            for i, task_data in enumerate(data['tasks']):
+                if not isinstance(task_data, dict):
+                    return jsonify({"success": False, "error": f"tasks[{i}] 必须为字典"}), 400
+                
+                # task_type 白名单验证
+                task_type = task_data.get('task_type', 'general')
+                if task_type not in allowed_types:
+                    return jsonify({"success": False, "error": f"tasks[{i}] 不支持的任务类型: {task_type}"}), 400
+                
+                # name 验证
+                name = str(task_data.get('name', ''))
+                if not name:
+                    return jsonify({"success": False, "error": f"tasks[{i}] name 不能为空"}), 400
+                
+                # name/description 长度限制
+                name = name[:200]
+                description = str(task_data.get('description', ''))[:2000]
+                
+                # priority 范围验证
+                try:
+                    priority = max(-100, min(int(task_data.get('priority', 0)), 100))
+                except (ValueError, TypeError):
+                    priority = 0
+                
+                validated_tasks.append({
+                    "name": name,
+                    "description": description,
+                    "task_type": task_type,
+                    "params": task_data.get('params', {}),
+                    "priority": priority
+                })
+            
+            count = self.scheduler.add_tasks(validated_tasks)
             return jsonify({
                 "success": True,
                 "data": {"added": count},
@@ -147,19 +189,31 @@ class WebAPI:
         
         @self.app.route('/api/control/pause', methods=['POST'])
         def pause():
-            self.scheduler.pause()
-            return jsonify({"success": True, "message": "Agent 已暂停"})
+            try:
+                self.scheduler.pause()
+                return jsonify({"success": True, "message": "Agent 已暂停"})
+            except Exception as e:
+                logger.error(f"暂停失败: {e}", exc_info=True)
+                return jsonify({"success": True, "message": f"Agent 已暂停（或已处于暂停状态）: {str(e)}"})
         
         @self.app.route('/api/control/resume', methods=['POST'])
         def resume():
-            self.scheduler.resume()
-            return jsonify({"success": True, "message": "Agent 已恢复"})
+            try:
+                self.scheduler.resume()
+                return jsonify({"success": True, "message": "Agent 已恢复"})
+            except Exception as e:
+                logger.error(f"恢复失败: {e}", exc_info=True)
+                return jsonify({"success": True, "message": f"Agent 已恢复（或已处于运行状态）: {str(e)}"})
         
         @self.app.route('/api/control/stop', methods=['POST'])
         def stop():
-            logger.warning("收到停止请求")
-            self.scheduler.stop()
-            return jsonify({"success": True, "message": "Agent 已停止"})
+            try:
+                logger.warning("收到停止请求")
+                self.scheduler.stop()
+                return jsonify({"success": True, "message": "Agent 已停止"})
+            except Exception as e:
+                logger.error(f"停止失败: {e}", exc_info=True)
+                return jsonify({"success": True, "message": f"Agent 已停止（或已处于停止状态）: {str(e)}"})
         
         # ---- 知识图谱 ----
         

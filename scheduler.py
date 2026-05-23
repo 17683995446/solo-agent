@@ -44,13 +44,13 @@ class KeepAliveScheduler:
         
         # 任务队列（优先级队列用 deque + 排序模拟）
         self._task_queue: deque = deque()
-        self._completed_tasks: List[Dict] = []
+        self._completed_tasks: deque = deque(maxlen=1000)
         self._completed_lock = threading.Lock()  # 保护已完成任务列表
         
         # 运行状态
         self._running = threading.Event()
         self._paused = threading.Event()
-        self._cycle_count = 0
+        self._optimizing = threading.Event()  # 优化线程运行标志，确保同一时间只有一个优化线程
         self._start_time = None
         self._last_optimize_cycle = 0
         
@@ -76,9 +76,9 @@ class KeepAliveScheduler:
             logger.warning("信号处理器注册失败（非主线程），请通过stop()方法优雅关闭")
     
     def _signal_handler(self, signum, frame):
-        """优雅关闭"""
+        """优雅关闭 - 信号处理函数中只设置标志位，不调用 stop() 方法（避免不安全操作）"""
         logger.info(f"收到信号 {signum}，正在优雅关闭...")
-        self.stop()
+        self._running.clear()
     
     # ---- 任务管理 ----
     
@@ -187,9 +187,9 @@ class KeepAliveScheduler:
         """
         while self._running.is_set():
             cycle_start = time.time()
-            self._cycle_count += 1
             with self._stats_lock:
                 self._stats["total_cycles"] += 1
+                cycle_count = self._stats["total_cycles"]
             
             try:
                 if self._paused.is_set():
@@ -206,8 +206,10 @@ class KeepAliveScheduler:
                 # ====== 第三线：知识积累 ======
                 self._knowledge_cycle()
                 
+            except (SystemExit, KeyboardInterrupt):
+                raise
             except Exception as e:
-                logger.error(f"循环 #{self._cycle_count} 异常: {e}", exc_info=True)
+                logger.error(f"循环 #{cycle_count} 异常: {e}", exc_info=True)
                 with self._stats_lock:
                     self._stats["auto_recoveries"] += 1
             
@@ -238,8 +240,6 @@ class KeepAliveScheduler:
             task_dict = result.to_dict()
             with self._completed_lock:
                 self._completed_tasks.append(task_dict)
-                if len(self._completed_tasks) > 1000:
-                    self._completed_tasks = self._completed_tasks[-500:]
             
             if result.status == TaskStatus.SUCCESS.value:
                 with self._stats_lock:
@@ -256,12 +256,19 @@ class KeepAliveScheduler:
     
     def _optimize_cycle_async(self):
         """优化线 - 异步执行，不阻塞主循环"""
+        # 如果已有优化线程在运行，跳过本次
+        if self._optimizing.is_set():
+            return
+
+        with self._stats_lock:
+            cycle_count = self._stats["total_cycles"]
         # 每执行 N 个任务做一次深度反思
-        if (self._cycle_count - self._last_optimize_cycle) >= self.config.scheduler.optimize_interval:
-            self._last_optimize_cycle = self._cycle_count
+        if (cycle_count - self._last_optimize_cycle) >= self.config.scheduler.optimize_interval:
+            self._last_optimize_cycle = cycle_count
             # 在后台线程执行，不阻塞执行线
             def _do_reflect():
                 try:
+                    self._optimizing.set()
                     logger.info("━━━ 优化线 ━━━ 执行深度反思...")
                     reflection = self.optimizer.deep_reflection()
                     # Bug修复: 后台线程修改 _stats 时使用 _stats_lock 保护，防止竞态条件
@@ -270,13 +277,17 @@ class KeepAliveScheduler:
                     logger.info(f"深度反思完成:\n{reflection[:500]}")
                 except Exception as e:
                     logger.error(f"深度反思失败: {e}")
+                finally:
+                    self._optimizing.clear()
             threading.Thread(target=_do_reflect, daemon=True).start()
     
     def _knowledge_cycle(self):
         """知识线 - 确保知识图谱持续更新"""
         # 知识积累在执行线和优化线中已经自动进行
         # 这里做周期性的知识整理
-        if self._cycle_count % 50 == 0 and self._cycle_count > 0 and self.kg:
+        with self._stats_lock:
+            cycle_count = self._stats["total_cycles"]
+        if cycle_count % 50 == 0 and cycle_count > 0 and self.kg:
             try:
                 stats = self.kg.get_stats()
                 logger.debug(
@@ -291,8 +302,10 @@ class KeepAliveScheduler:
         空闲改进 - 无任务时保持运转
         第一性原理：Agent 永远不闲着
         """
+        with self._stats_lock:
+            cycle_count = self._stats["total_cycles"]
         # 每隔几轮空闲才执行一次改进（避免过于频繁）
-        if self._cycle_count % 5 != 0:
+        if cycle_count % 5 != 0:
             return
         
         logger.debug("━━━ 空闲改进 ━━━ 无待执行任务，进行自我提升...")
@@ -304,7 +317,7 @@ class KeepAliveScheduler:
             ("self_improve", "自我改进分析"),
         ]
         
-        action_type, action_name = idle_actions[self._cycle_count % len(idle_actions)]
+        action_type, action_name = idle_actions[cycle_count % len(idle_actions)]
         
         task = Task(
             name=action_name,
@@ -325,13 +338,16 @@ class KeepAliveScheduler:
         自动恢复 - 崩溃后自动重启
         Bug修复: 将递归调用 _main_loop 改为 while True 循环，防止栈溢出
         Bug修复: 在设置 _running=True 前检查是否已被外部停止（如信号处理调用了 stop()）
+        Bug修复: 添加最大重试次数限制，防止无限恢复循环
         """
+        max_retries = 10
         logger.warning("🔄 触发自动恢复机制...")
         with self._stats_lock:
             self._stats["auto_recoveries"] += 1
 
         # Bug修复: 使用 while True 循环代替递归调用 _main_loop，避免栈溢出
-        while True:
+        retry_count = 0
+        while retry_count < max_retries:
             # 短暂等待
             time.sleep(3)
 
@@ -352,10 +368,15 @@ class KeepAliveScheduler:
                 # _main_loop 正常返回（_running 被设为 False），退出恢复循环
                 return
             except Exception as e2:
-                logger.critical(f"自动恢复失败: {e2}")
+                retry_count += 1
+                logger.critical(f"自动恢复失败 (第 {retry_count}/{max_retries} 次): {e2}")
                 # Bug修复: 循环重试而非递归，检查是否应继续恢复
                 if not self._running.is_set():
                     logger.info("  自动恢复终止: Agent 已被外部停止")
+                    return
+                if retry_count >= max_retries:
+                    logger.error(f"自动恢复已达最大重试次数 ({max_retries})，停止恢复。"
+                                 f"最后错误: {e2}")
                     return
                 # 继续循环，下一次迭代将再次尝试恢复
     
@@ -364,13 +385,14 @@ class KeepAliveScheduler:
         logger.info("正在执行优雅关闭...")
         with self._stats_lock:
             self._stats["uptime_seconds"] = time.time() - self._start_time if self._start_time else 0
+            cycle_count = self._stats["total_cycles"]
         
         # 保存最终统计
         if self.kg:
             try:
                 self.kg.store_experience(
-                    title=f"运行统计 #{self._cycle_count}",
-                    content=f"循环次数: {self._cycle_count}, "
+                    title=f"运行统计 #{cycle_count}",
+                    content=f"循环次数: {cycle_count}, "
                            f"完成任务: {self._stats['tasks_completed']}, "
                            f"失败任务: {self._stats['tasks_failed']}, "
                            f"优化次数: {self._stats['optimizations']}, "
@@ -394,7 +416,9 @@ class KeepAliveScheduler:
 
     def get_status(self) -> Dict:
         """获取 Agent 当前状态"""
-        uptime = time.time() - self._start_time if self._start_time else 0
+        with self._stats_lock:
+            uptime = time.time() - self._start_time if self._start_time else 0
+            cycle_count = self._stats["total_cycles"]
         with self._completed_lock:
             completed_count = len(self._completed_tasks)
         return {
@@ -402,7 +426,7 @@ class KeepAliveScheduler:
             "paused": self._paused.is_set(),
             "name": self.config.name,
             "version": self.config.version,
-            "cycle_count": self._cycle_count,
+            "cycle_count": cycle_count,
             "queue_size": self.get_queue_size(),
             "completed_tasks": completed_count,
             "uptime_seconds": round(uptime, 1),
